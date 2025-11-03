@@ -1,4 +1,5 @@
 import glob
+import os
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 import pytorch_lightning as pl
@@ -26,7 +27,8 @@ class ProcessedSceneDataset(Dataset):
 def simple_collate_fn(batch):
     elem = batch[0]
     out = {}
-    for key in elem:
+    keys = list(batch[0].keys())[1:]
+    for key in keys:
         if key == 'edge_index':
             # edge_index 对所有样本都是一样的，只取第一个即可
             out[key] = elem[key]
@@ -40,7 +42,7 @@ def main(cfg):
     pl.seed_everything(1235)
 
     # 3. 直接加载处理好的数据
-    dataset = ProcessedSceneDataset('/mnt/nvme_share/srt02/EPV_Transformer/QT_NBA/shotData_516_processed')
+    dataset = ProcessedSceneDataset('/root/autodl-fs/shotData_onball_preprocessed2')
     
     print(f"Dataset size: {len(dataset)}")
     
@@ -50,7 +52,10 @@ def main(cfg):
         sample_data = dataset[0]
         print(f"Sample data keys: {sample_data.keys()}")
         for k, v in sample_data.items():
-            print(f"  {k}: {v.shape}, {v.dtype}")
+            if hasattr(v, "shape") and hasattr(v, "dtype"):
+                print(f"  {k}: {v.shape}, {v.dtype}")
+            else:
+                print(f"  {k}: type={type(v)} -> skipped (non-tensor)")
     except Exception as e:
         print(f"Error loading sample data: {e}")
         return
@@ -62,13 +67,15 @@ def main(cfg):
     # 测试 collate_fn
     print("Testing collate function...")
     try:
-        test_batch = [dataset[i] for i in range(min(2, len(dataset)))]
-        collated = simple_collate_fn(test_batch)
-        print(f"Collated batch keys: {collated.keys()}")
-        for k, v in collated.items():
-            print(f"  {k}: {v.shape}, {v.dtype}")
+        sample_data = dataset[0]
+        print(f"Sample data keys: {sample_data.keys()}")
+        for k, v in sample_data.items():
+            if hasattr(v, "shape") and hasattr(v, "dtype"):
+                print(f"  {k}: {v.shape}, {v.dtype}")
+            else:
+                print(f"  {k}: type={type(v)} -> skipped (non-tensor)")
     except Exception as e:
-        print(f"Error in collate function: {e}")
+        print(f"Error loading sample data: {e}")
         return
 
     # 优化数据加载配置
@@ -76,7 +83,7 @@ def main(cfg):
         train_dataset, 
         batch_size=cfg.batchsize, 
         shuffle=True, 
-        num_workers=12,  # 增加worker数量
+        num_workers=8,  # 增加worker数量
         collate_fn=simple_collate_fn, 
         drop_last=True, 
         pin_memory=True,
@@ -87,7 +94,7 @@ def main(cfg):
         val_dataset, 
         batch_size=cfg.batchsize, 
         shuffle=False, 
-        num_workers=12,  # 增加worker数量
+        num_workers=8,  # 增加worker数量
         collate_fn=simple_collate_fn, 
         drop_last=True, 
         pin_memory=True,
@@ -95,17 +102,19 @@ def main(cfg):
         prefetch_factor=2  # 预取因子
     )
 
-    checkpoint_path = 'checkpoints/'
+    checkpoint_path = '/root/autodl-tmp/QT_checkpoints'
     checkpoint_callback = ModelCheckpoint(
-        monitor='val/q_mean',
+        monitor='val/l1_q_vs_mc',
         dirpath=checkpoint_path,
         filename='model-{epoch:02d}-{val_q_mean:.4f}',
         save_top_k=3,
         mode='max'
     )
 
+    tb_log_dir = '/root/tf-logs'
+    os.makedirs(tb_log_dir, exist_ok=True)
     model = QT(cfg)
-    tb_logger = TensorBoardLogger("logs/", name=cfg.check_point_name)
+    tb_logger = TensorBoardLogger(tb_log_dir, name=cfg.check_point_name)
 
     trainer = pl.Trainer(
         max_epochs=cfg.max_epochs,

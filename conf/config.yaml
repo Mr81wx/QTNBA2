@@ -1,29 +1,31 @@
-device_ids: 1
-max_epochs: 10
-batchsize: 64
+device_ids: 0
+max_epochs: 30
+batchsize: 96
 flag: 0
-check_point_name: 0622_flag${flag}
+check_point_name: 1030_soft_ball_pl
+only_ball: False
 # === Optimizer Settings ===
 Optimizer:
-  lr: 2e-4
-  eps: 1e-8
+  lr: 1e-3
+  eps: 1e-5
   decay: 0.0001
 
 # === Reinforcement Learning Settings ===
-discount_factor_gamma: 0.95
-min_reward: -0.5
+discount_factor_gamma: 0.98
+min_reward: -3.0
 td_loss_coef: 1.0
 cql_loss_coef: 1.0
 
+soft_alpha: 0.1
 # === Model Architecture ===
 qtransformer:
-  device: cuda:1
-  in_feat_dim: 3
+  device: cuda:0
+  in_feat_dim: 1
   time_steps: 80
-  embed_dim: 256
-  num_bins: 28 # 0-7 ball, 8-26 player 27 padding
+  embed_dim: 128
+  num_bins: 30 # 0-5 ball, 6-24 player 30 padding
   num_bins_player: 19
-  num_bins_ball: 8
+  num_bins_ball: 6
   num_actions: 6         # a0 ~ a5
   max_tokens: 32         # for positional embedding
   decoder_layers: 3

@@ -1,0 +1,634 @@
+import pytorch_lightning as pl
+import copy
+import torch
+import torch.nn as nn
+from ema_pytorch import EMA
+from pytorch_lightning.loggers import TensorBoardLogger
+from torch.optim.lr_scheduler import LambdaLR
+
+
+import copy, torch, torch.nn.functional as F
+from einops import rearrange, repeat
+
+
+
+from .QTransformer_soft import QTransformer
+
+from .utils import *
+
+# ---- 还原并拼回 25‑logit ----
+def reshape_and_cat(q_ball, q_pl):
+    q_ball = q_ball.squeeze(1)
+    return cat_ball_player(q_ball, q_pl)                   # [B*T, 6, 25]
+
+def cat_ball_player(q_ball, q_players):
+    """
+    q_ball    : [B*T, 6]           – ball‑head logits
+    q_players : [B*T, P, 19]       – player‑head logits，P 可以是 1、5、甚至可变
+    returns   : [B*T, 1+P, 25]
+    """
+    inf  = -torch.inf
+    BTx  = q_ball.size(0)
+    P    = q_players.size(1)       # 自动拿玩家行数
+    dev  = q_ball.device
+    dtype= q_players.dtype
+
+    pad_front = torch.full((BTx, P, 6), inf, device=dev, dtype=dtype)
+    players_padded = torch.cat([pad_front, q_players], dim=-1)   # [B*T, P, 25]
+
+    pad_back = torch.full((BTx, 19), inf, device=dev, dtype=q_ball.dtype)
+    ball_padded = torch.cat([q_ball, pad_back], dim=-1).unsqueeze(1)  # [B*T,1,25]
+
+    return torch.cat([ball_padded, players_padded], dim=1)       # [B*T, 1+P, 25]
+
+
+class QT(pl.LightningModule):
+    def __init__(self, cfg):
+        super(QT, self).__init__()
+
+        self.cfg = cfg
+
+        self.min_reward = cfg.min_reward
+        self.discount_factor_gamma = cfg.discount_factor_gamma
+
+        self.model = QTransformer(self.cfg.qtransformer)
+
+        self.ema_model = EMA(self.model,include_online_model = False,
+                             beta = cfg.ema.beta,
+                             update_after_step = cfg.ema.update_after_step,
+                             update_every = cfg.ema.update_every)
+        
+        self.soft_alpha = cfg.soft_alpha
+        self.only_ball = cfg.only_ball 
+    
+    def forward(self, batch):
+        state_tokens = batch['state_tokens'] #598为无效帧补齐的
+        agent_ids = batch['agent_ids']
+        padding_mask = batch['padding_mask'] #[B*A,T] 
+        action_tokens = batch['action_tokens'] # [B*A,T] #30为无效帧补齐的
+
+        edge_index = batch['edge_index']  #[2,110]
+        edge_attr = batch['edge_attr'] #[B,T,110,1]
+
+        rewards = batch['rewards'] #[B,T] 实际最后一个timesteps都是shot，只有a0一个action -1e9 为无效
+        done = batch['done'] # [B] 每一个回合的实际长度
+
+        monte_carlo_return = default(batch['mc_return'], -1e4) #[B,T]
+
+        out = self.model(state_tokens, agent_ids, padding_mask, action_tokens, edge_index, edge_attr) 
+        # out =  {
+        # "A": heads["A"],   # # [B*T,1,C_ball] [B*T,5,C_pl]
+        # "V": heads["V"],     # [B*T,1,1] [B*T,5,1]   # 现在是四头结构：ball.{1,2}, pl.{1,2}
+        # "nbias": heads["nbias"], 
+        # "qsq": qsq # [B,6,T,1]
+        #}
+
+        return out
+
+    def training_step(self, batch, batch_idx):
+        total_loss,td_loss,cql_loss,entropy_mean,qsq_loss,kl_loss = self.compute_loss(batch)
+
+        self.log_dict({
+            "train/total_loss": total_loss,
+            "train/td_loss": td_loss,
+            "train/cql_loss": cql_loss,
+            "train/entropy" : entropy_mean,
+            "train/qsq":qsq_loss,
+            "train/kl_loss":kl_loss
+            #"train/reverse_penalty": reverse_penalty,
+        }, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/lr", self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=False)
+            
+        return total_loss
+    
+    def training_step_end(self, outputs):
+        print("=== Gradient Check ===")
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                print(f"{name:<40} | grad mean: {param.grad.abs().mean():.4e} | max: {param.grad.abs().max():.4e}")
+            else:
+                print(f"{name:<40} | grad is None")
+        self.ema_model.update() 
+        return outputs
+
+    @torch.no_grad()
+    def validation_step(self, batch,batch_idx):
+        # ---------- unpack ----------
+        state_tokens  = batch['state_tokens']
+        agent_ids     = batch['agent_ids']
+        padding_mask  = batch['padding_mask']        # [B*A, T]
+        action_tokens = batch['action_tokens']       # [B*A, T]
+        rewards       = batch['rewards']             # [B, T]
+        done          = batch['done']                # [B]
+        edge_index    = batch['edge_index']
+        edge_attr     = batch['edge_attr']
+        mc_return     = default(batch['mc_return'], -1e4) #[B, T]
+
+        B, T = rewards.shape
+
+        # ---------- forward ----------
+        out = self.model(state_tokens, agent_ids,
+                        padding_mask, action_tokens,
+                        edge_index, edge_attr)
+
+        # ---------- avg-head logits ----------
+        A_ball_1, A_ball_2 = out["A"]["ball"]["1"], out["A"]["ball"]["2"]
+        A_pl_1,   A_pl_2   = out["A"]["pl"]["1"], out["A"]["pl"]["2"]
+        V_ball_1, V_ball_2 = out["V"]['ball']["1"], out["V"]['ball']["2"]
+        V_pl_1, V_pl_2 = out["V"]['pl']["1"], out["V"]['pl']["2"]
+        nb       = out["nbias"] if out["nbias"] is not None else 0.0
+        P = 5                     # 动态拿玩家行数
+        A = 6                                    # 总行数 (ball + players)
+
+        q_ball_avg = 0.5 * ((V_ball_1 + nb + A_ball_1) + (V_ball_2 + nb + A_ball_2))  # [B*T,1,C_ball]
+        q_player_avg   = 0.5 * ((V_pl_1 + nb + A_pl_1)   + (V_pl_2 + nb + A_pl_2))    # [B*T,5,C_pl]
+
+
+        # === 真实动作 ===
+        ball_action = action_tokens[0::A, :]  # [B, T]
+        player_action = rearrange(action_tokens, '(b a) t -> b t a', a=6)[..., 1:]  # [B, T, 5]
+        player_action = rearrange(player_action, 'b t a -> (b t) a')  # [B*T, 5]
+
+        # ---------- 1. Q mean ----------
+        q_ball_selected = batch_ball_select_indices(q_ball_avg, action_tokens) # [B*T, 1]
+
+        q_player_selected = batch_player_select_indices(q_player_avg , action_tokens) #[B*T, 5]
+
+        #mask_ball = ((ball_action != 27) & (ball_action != 7)).reshape(-1) # [B*T]
+        mask_ball = (ball_action != 30).reshape(-1) # [B*T]
+        mask_ball = mask_ball.unsqueeze(-1)  # [B*T, 1]
+        mask_player =  (player_action != 30) # [B*T,5]
+
+        q_mean_ball = q_ball_selected[mask_ball.bool()].mean()
+        q_mean_player = q_player_selected[mask_player.bool()].mean()
+        
+        #q_mean = 0.5 * q_mean_ball + 0.5 * q_mean_player
+        self.log("val/q_mean_ball", q_mean_ball)
+        self.log("val/q_mean_player", q_mean_player)
+
+        # ---------- 2. policy accuracy ----------
+
+      
+
+        # === argmax 动作 ===
+        q_ball_argmax = q_ball_avg.argmax(dim=-1)  # [B*T, 1]
+        q_player_argmax = q_player_avg.argmax(dim=-1)  # [B*T, 5]
+
+        # reshape ball_action: [B, T] → [B*T, 1]
+        ball_action_flat = ball_action.reshape(-1, 1)          # [B*T, 1]
+
+        # === accuracy ===
+        acc_ball = (q_ball_argmax == ball_action_flat)[mask_ball].float().mean()
+        acc_player = (q_player_argmax == player_action)[mask_player].float().mean()
+
+        self.log("val/acc_ball", acc_ball)
+        self.log("val/acc_player", acc_player)
+        
+        # ---------- 3. L1( Q_p5 , MC ) ----------
+        # q_p5_selected = q_player_selected[...,-1] #[B,T]
+        # q_p5_selected = rearrange(q_p5_selected, '(b t) -> b t', b=B)  # [B, T]
+        
+        # mc_return = mc_return.squeeze(-1)  # [B,T]
+        # l1 = F.l1_loss(q_p5_selected, mc_return, reduction='none')  # [B,T]
+        
+        # mask_p5 = mask_player[..., -1]  # [B*T]
+        # mask_p5 = rearrange(mask_p5, '(b t) -> b t', b=B)  # [B, T]
+        # l1 = l1[mask_p5.bool()].mean()
+
+        # self.log("val/l1_q_vs_mc", l1, prog_bar=True)
+
+
+
+    def compute_loss(self, batch):
+        """
+        split ball and player compute_loss
+        """
+        # ---------- 取 batch ----------
+        state_tokens  = batch['state_tokens']     # [B*A, T, 1]
+        agent_ids     = batch['agent_ids']        # [B*A]
+        padding_mask  = batch['padding_mask']     # [B*A, T]
+        action_tokens = batch['action_tokens']    # [B*6, T]
+        action_tokens_cql = copy.deepcopy(action_tokens)
+
+        rewards  = batch['rewards']               # [B, T]
+        done     = batch['done']                  # [B]
+        mc_ret   = batch['mc_return']             # [B, T]
+        edge_idx = batch['edge_index']            # [2,132]
+        edge_attr= batch['edge_attr']             # [B,T,132,1]
+
+        qsq_gt = batch['qsq']                     # [B*5,T]
+
+        B, T = rewards.shape
+        Y = self.discount_factor_gamma
+
+        # #state mask， 对于在state中有球员在后场的情况都不去计算该球员的移动loss，{TODO_ 同时对于球的行为7的不去计算这一帧与球相关的loss}
+        # state_x = state_tokens[...,0] #[B*A,T]
+        # state_x = rearrange(state_x,'(b a) t -> b t a',b=B)
+        # state_x = state_x[:,:,:6] # [B,T,5]
+        # #invalid_state_mask = (state_x > 53).float()  # [B, T， 5]，
+        # invalid_state_mask = (state_x > 53).any(dim=-1)  # [B, T] 对任意state中有进攻球员在后场，都直接不算其loss
+        
+        # 构造每个样本 done-1 的索引
+        # batch_idx = torch.arange(B, device=done.device)  # [B]
+        # last_valid_idx = done - 1                        # [B]
+
+        # 在 invalid_state_mask 中将 done-1 的帧置为 False,确保投篮帧的loss一定考虑
+        # invalid_state_mask = invalid_state_mask.clone()
+        # invalid_state_mask = invalid_state_mask.scatter(dim=1, index=last_valid_idx.unsqueeze(1), value=False)
+
+
+        # ---------- 前向 ----------
+        # self.model 输出嵌套字典，两套 head
+        out_pred = self.model(state_tokens, agent_ids,
+                            padding_mask, action_tokens,
+                            edge_idx, edge_attr)
+
+        # out = {
+        #         "A": heads["A"],
+        #         "V": heads["V"],        # 现在是四头结构：ball.{1,2}, pl.{1,2}
+        #         "nbias": heads["nbias"],
+        #         "qsq": qsq
+        #     }
+
+        # players: [ B*T,5, 19]    ball: [ B*T,1, 8]
+        a_pl_1  = out_pred['A']['pl']['1']  #[ B*T,5, 19] 
+        a_pl_2  = out_pred['A']['pl']['2']  
+        
+        a_ball_1 = out_pred['A']['ball']['1'] #[ B*T,1, 6]
+        a_ball_2 = out_pred['A']['ball']['2']
+
+        v_pl_1  = out_pred['V']['pl']['1']  #[ B*T,5, 1]
+        v_pl_2  = out_pred['V']['pl']['2']
+
+        v_ball_1 = out_pred['V']['ball']['1'] #[ B*T,1, 1]
+        v_ball_2 = out_pred['V']['ball']['2'] #[ B*T,1, 1]
+
+        qsq_pred = out_pred['qsq'].squeeze(-1) # [B,5,T]
+        #print("qsq_pred:", qsq_pred.shape)
+
+        # ---------- select 本步 Q ----------
+        if out_pred['nbias'] is None:
+            nb = 0.0
+
+        alpha = self.soft_alpha
+
+        soft_a_ball_1 = a_ball_1 - alpha * torch.logsumexp(a_ball_1 / alpha, dim=-1, keepdim=True)
+        soft_a_ball_2 = a_ball_2 - alpha * torch.logsumexp(a_ball_2 / alpha, dim=-1, keepdim=True)
+
+        soft_a_pl_1 = a_pl_1 - alpha * torch.logsumexp(a_pl_1 / alpha, dim=-1, keepdim=True)
+        soft_a_pl_2 = a_pl_2 - alpha * torch.logsumexp(a_pl_2 / alpha, dim=-1, keepdim=True)
+
+        adv1a_ball = batch_ball_select_indices( soft_a_ball_1,action_tokens) #[B*T, 1] 
+        adv2a_ball = batch_ball_select_indices( soft_a_ball_2,action_tokens) #[B*T, 1]
+    
+
+
+        adv1a_pl = batch_player_select_indices( soft_a_pl_1,action_tokens) #[B*T, 5]
+        adv2a_pl = batch_player_select_indices( soft_a_pl_2,action_tokens) #[B*T, 5]
+
+        q_pred_1_ball = v_ball_1 + nb + adv1a_ball.unsqueeze(-1)          # [B*T,1,1]
+        q_pred_2_ball = v_ball_2 + nb + adv2a_ball.unsqueeze(-1)         # [B*T,1,1]
+
+        q_pred_1_player =  v_pl_1 + nb + adv1a_pl.unsqueeze(-1)    # [B*T,5,1]
+        q_pred_2_player =  v_pl_2 + nb + adv2a_pl.unsqueeze(-1)
+
+
+        q_pred_1 = torch.cat([q_pred_1_ball, q_pred_1_player], dim=1)
+        q_pred_2 = torch.cat([q_pred_2_ball, q_pred_2_player], dim=1)
+
+        q_pred_1 = rearrange(q_pred_1,'(b t) n 1-> b t n', b=B)
+        q_pred_2 = rearrange(q_pred_2,'(b t) n 1-> b t n', b=B)
+       
+        # ---------- target 网络 ----------
+        ball_action = action_tokens[0::6,:] #[B,T]  action_tokens [B*6,T]
+        valid_mask_ball =  (ball_action != 30) #[B,T] 30为无效帧补齐的
+        valid_mask_ball = rearrange(valid_mask_ball, 'b t -> (b t) 1')  #[B*T,1]
+
+        player_action = rearrange(action_tokens,'(b a) t -> b a t',a = 6)[:,1:,:]
+        player_action = rearrange(player_action, 'b a t -> (b t) a')  #[B*T,5]
+        valid_mask_player = (player_action != 30) #[B*T,5]
+
+        with torch.no_grad():
+            out_target = self.ema_model(state_tokens, agent_ids,
+                                        padding_mask, action_tokens,
+                                        edge_idx, edge_attr)
+
+            V_target = out_target['V']
+
+            q_pl_target   = torch.min(V_target['pl']['1'],V_target['pl']['2'])  # 取 avg 头 or min [ B*T,5, 1] 
+            q_ball_target = torch.min(V_target['ball']['1'],V_target['ball']['2'])  #[ B*T,1, 1] 
+
+            q_pl_target = q_pl_target.squeeze(-1)  # [B*T,5]
+            q_ball_target = q_ball_target.squeeze(-1)  # [B*T,1]
+            q_pl_target = q_pl_target * valid_mask_player.float() #把无效帧的q值设置为0
+            q_ball_target = q_ball_target * valid_mask_ball.float() #把无效帧的q值设置为0
+                        
+            #q_ball_target_max = q_ball_target.max(dim=-1).values          # [B*T, 1]
+            #q_pl_target_max = q_pl_target.max(dim=-1).values  #[B*T,5]
+
+            q_target = torch.cat([q_ball_target, q_pl_target], dim=-1) #[B*T, 6]
+            q_target = rearrange(q_target, '(b t) n -> b t n', b=B) # [B, T, 6]
+
+            #mc_ret = mc_ret.squeeze(-1)  # [B,T]
+            #mc_ret   = repeat(default(mc_ret, -10), 'b t -> (b t) n', n=6) # [B*T, 6]
+            #q_target = q_target.clamp(min=mc_ret.reshape(B, T, 6))
+
+        # ---------- 分离predict [ball,p1,p2,p3,p4] [p5]   ----------
+        # ---------- 分离target  [p1,p2,p3,p4,p5]   [ball] ----------
+        #            对应计算loss ball_pred <-> p1_target .... p5_pred <-> r + y * ball_target
+
+        done_mask = build_loss_mask_from_lengths(done, T).to(rewards.device) #[B,T] True for valid steps
+        q_target_ball = q_target[...,0]  #[B,T]
+        q_target_ball[:,1:] = rewards[:,:-1] + Y * q_target_ball[:,1:] * done_mask[:,1:].float() #[B,T] q_target_ball[:,0]不参与loss计算
+
+        #new q_target [B,T,6] 更新了 ball 的 target q 值
+
+        # ---------- TD Loss  ---------- ball + player
+        if self.only_ball:
+            #只计算球的loss
+            #只考虑球的动作，不考虑球员动作
+            q_pred_first_1 = q_pred_1[...,0] #[B,T]
+            q_pred_first_2 = q_pred_2[...,0] #[B,T]
+            q_pred_first_1 = q_pred_first_1[...,:-1] #[B,T-1]
+            q_pred_first_2 = q_pred_first_2[...,:-1] #[B,T-1]
+
+            q_target_ball_t1 = q_target_ball[...,1:] #[B,T-1] 从index 1开始 q_pred_0 <-> q_target_1
+
+        
+            loss_ball_1 = F.smooth_l1_loss(q_pred_first_1, q_target_ball_t1,reduction='none') #[B,T-1]
+            loss_ball_2 = F.smooth_l1_loss(q_pred_first_2, q_target_ball_t1,reduction='none') #[B,T-1]
+            
+            loss_ball_mask = done_mask[:,:-1] # [B,T-1] 
+
+
+            loss_ball_1 = loss_ball_1 * loss_ball_mask.float()#[B,T-1]
+            loss_ball_2 = loss_ball_2 * loss_ball_mask.float()#[B,T-1]
+
+            td_loss_ball = loss_ball_1.mean() + loss_ball_2.mean()
+
+            td_loss = td_loss_ball
+
+        else:
+            q_pred_1_flat = rearrange(q_pred_1, 'b t n -> b (t n)') #[B,T*6]
+            q_pred_2_flat = rearrange(q_pred_2, 'b t n -> b (t n)') #[B,T*6]
+            q_target_flat = rearrange(q_target, 'b t n -> b (t n)') #[B,T*6]
+
+            loss_1 = F.smooth_l1_loss(q_pred_1_flat[:,1:], q_target_flat[:,:-1],reduction='none') #[B,T*6-1]
+            loss_2 = F.smooth_l1_loss(q_pred_2_flat[:,1:], q_target_flat[:,:-1],reduction='none') #[B,T*6-1]
+
+            done_mask_flat = build_loss_mask_from_lengths((done-1)*6+1, T*6-1).to(rewards.device) #[B,T*6-1]
+
+            loss_1 = loss_1 * done_mask_flat.float()#[B,T-1]
+            loss_2 = loss_2 * done_mask_flat.float()#[B,T-1]
+
+            td_loss = loss_1.mean() + loss_2.mean()
+        #-----------------------------------------------------------------
+
+        # conservative loss
+
+        # pred player ： a_pl_1 q_pl_2 [ B*T,5, 19] 
+        # pred ball ： q_bal_1 a_ball_2 [B*T,1,6]
+
+        # player_action: [B*T，5]
+        # ball_action: [B,T]
+
+        player_action = rearrange(player_action,'(b t) a -> b t a', b=B)
+        
+        q_ball_1 = v_ball_1 + nb + a_ball_1      # [B*T, 1, 6]
+        q_ball_2 = v_ball_2 + nb + a_ball_2      # [B*T, 1, 6]  
+        cql_loss_ball_1 = cql_loss_logsumexp_ball(q_ball_1,ball_action,q_ball_1.device) # [B*T, 1]
+        cql_loss_ball_2 = cql_loss_logsumexp_ball(q_ball_2,ball_action,q_ball_2.device) # [B*T, 1]
+
+        q_pl_1 = v_pl_1 + nb + a_pl_1      # [B*T, 5, 19]
+        q_pl_2 = v_pl_2 + nb + a_pl_2      # [B*T, 5, 19]
+        cql_loss_pl_1 = cql_loss_logsumexp_player(q_pl_1,player_action,q_pl_1.device) #[B*T, 5]
+        cql_loss_pl_2 = cql_loss_logsumexp_player(q_pl_2,player_action,q_pl_2.device) #[B*T, 5]
+
+
+        if self.only_ball:
+            cql_loss = ( (cql_loss_ball_1.mean() + cql_loss_ball_2.mean())/2 )
+        else:
+            cql_loss = ( (cql_loss_ball_1.mean() + cql_loss_ball_2.mean())/2 
+                   + (cql_loss_pl_1.mean() + cql_loss_pl_2.mean())/2 )
+        
+
+
+        #-----------------------------------------------------------------
+
+        # conservative loss     
+        # entropy_player_1 = entropy_reg_player(a_pl_1, player_action)
+        # entropy_player_2 = entropy_reg_player(q_pl_2, player_action)
+
+        entropy_ball_1 = entropy_reg_ball(a_ball_1, ball_action)
+        entropy_ball_2 = entropy_reg_ball(a_ball_2, ball_action)
+
+        #entropy_mean = entropy_player_1 + entropy_player_2 + entropy_ball_1 + entropy_ball_2
+        entropy_mean =  entropy_ball_1 + entropy_ball_2
+
+
+        #qsq predict loss 
+        qsq_gt = rearrange(qsq_gt,'(b a) t -> b a t',a = 5) #[B,5,T]
+        qsq_loss = F.mse_loss(qsq_gt, qsq_pred, reduction='none') #[B,5,T]
+        qsq_loss_mask = build_loss_mask_from_lengths(done, T).to(qsq_loss.device) #[B,T]
+        qsq_loss_mask = qsq_loss_mask.bool().unsqueeze(1).expand(-1, 5, -1) #[B,5,T]
+        qsq_loss = (qsq_loss * qsq_loss_mask.float()).mean()
+
+        #KL loss
+        kl_loss_q1 = compute_kl_regularizer(a_ball_1, ball_action, alpha_kl=0.05)
+        kl_loss_q2 = compute_kl_regularizer(a_ball_2, ball_action, alpha_kl=0.05)
+
+        kl_loss = (kl_loss_q1 + kl_loss_q2) /2
+
+        if self.global_step % 50 == 0:  # 每 500 步打印一次
+            b_idx = 0  # 打印第一个 batch 的样本
+            t_idx = done[b_idx] - 1  # 打印最后一帧（done帧）
+            
+            print(f"\n[Step {self.global_step}] QSQ Prediction Example:")
+            print(f"GT   : {qsq_gt[b_idx, :, t_idx].detach().cpu().numpy()}")
+            print(f"Pred : {qsq_pred[b_idx, :, t_idx].detach().cpu().numpy()}")
+
+        # total_loss = (self.cfg.td_loss_coef * td_loss +
+        #             self.cfg.cql_loss_coef * cql_loss -
+        #             0 * entropy_mean + 0.1 * qsq_loss)
+        warmup_steps = 2000
+        if self.global_step < warmup_steps:
+            total_loss = qsq_loss * 1.0  # 仅优化 qSQ
+        else:
+            total_loss = td_loss + cql_loss + 0.1 * qsq_loss - 0.0 * entropy_mean + 0.0 * kl_loss
+        #total_loss = td_loss +  cql_loss + 0.5 * qsq_loss - 0.0 * entropy_mean + 0.0 * kl_loss
+        #total_loss =   0.1 * qsq_loss
+
+        if self.global_step % 50 == 0:
+            with torch.no_grad():
+                # ---- Ball Q 值直方图 ----
+                q_ball_pred = a_ball_1.detach()  # [B*T, 1, 6]
+                valid_q_ball = q_ball_pred[valid_mask_ball]  # [N, 6]
+                self.logger.experiment.add_histogram(
+                    tag="q_values/ball1",
+                    values=valid_q_ball,
+                    global_step=self.global_step
+                )
+
+                # ---- Ball argmax bin ----
+                q_ball_argmax = q_ball_pred.argmax(dim=-1).reshape(-1)  # [B*T]
+                q_ball_argmax_valid = q_ball_argmax[valid_mask_ball[..., 0].squeeze(-1)]  # [N]
+
+                num_bins = q_ball_pred.shape[-1]  # 比如8
+                bin_counts = torch.bincount(q_ball_argmax_valid, minlength=num_bins)
+
+                # 打印统计结果
+                print(f"Ball action bin counts 1: {bin_counts.tolist()}")
+                self.logger.experiment.add_histogram(
+                    tag="actions/1_ball_argmax_bin",
+                    values=q_ball_argmax_valid,
+                    global_step=self.global_step
+                )
+
+                #-----------------------------------------------------------------
+
+                q_ball_pred = a_ball_2.detach()  # [B*T, 1, 6]
+                valid_q_ball = q_ball_pred[valid_mask_ball]  # [N, 6]
+                self.logger.experiment.add_histogram(
+                    tag="q_values/ball2",
+                    values=valid_q_ball,
+                    global_step=self.global_step
+                )
+
+                # ---- Ball argmax bin ----
+                q_ball_argmax = q_ball_pred.argmax(dim=-1).reshape(-1)  # [B*T]
+                q_ball_argmax_valid = q_ball_argmax[valid_mask_ball[..., 0].squeeze(-1)]  # [N]
+
+                num_bins = q_ball_pred.shape[-1]  # 比如6
+                bin_counts = torch.bincount(q_ball_argmax_valid, minlength=num_bins)
+
+                # 打印统计结果
+                print(f"Ball action bin counts 2: {bin_counts.tolist()}")
+                self.logger.experiment.add_histogram(
+                    tag="actions/2_ball_argmax_bin",
+                    values=q_ball_argmax_valid,
+                    global_step=self.global_step
+                )
+                
+                #-----------------------------------------------------------------
+
+
+                # ---- Player1 Q 值直方图 ----
+
+                q_player_pred = a_pl_1.detach()  # [B*T, 5, 19]
+
+                for pid in range(5):
+                    mask_pid = valid_mask_player[:, pid]  # [B*T]
+                    q_valid_pid = q_player_pred[:, pid, :][mask_pid]  # [N, 19]
+
+                    # optional: 防止 NaN
+                    q_valid_pid = q_valid_pid[torch.isfinite(q_valid_pid).all(dim=-1)]
+
+                    self.logger.experiment.add_histogram(
+                        tag=f"q_values/1_player{pid+1}",
+                        values=q_valid_pid,
+                        global_step=self.global_step
+                    )
+
+                # ---- Player1 argmax 直方图 ----
+                q_player_argmax = q_player_pred.argmax(dim=-1)  # [B*T, 5]
+                num_bins = q_player_pred.shape[-1]  # 19
+
+                for pid in range(5):
+                    mask_pid = valid_mask_player[:, pid]  # [B*T]
+                    argmax_valid = q_player_argmax[:, pid][mask_pid]  # [N]
+
+                    self.logger.experiment.add_histogram(
+                        tag=f"actions/1_player{pid+1}_argmax_bin",
+                        values=argmax_valid,
+                        global_step=self.global_step
+                    )
+                #-----------------------------------------------------------------
+
+
+                # ---- Player2 Q 值直方图 ---
+                q_player_pred = a_pl_2.detach()  # [B*T, 5, 19]
+
+                for pid in range(5):
+                    mask_pid = valid_mask_player[:, pid]  # [B*T]
+                    q_valid_pid = q_player_pred[:, pid, :][mask_pid]  # [N, 19]
+
+                    # optional: 防止 NaN
+                    q_valid_pid = q_valid_pid[torch.isfinite(q_valid_pid).all(dim=-1)]
+
+                    self.logger.experiment.add_histogram(
+                        tag=f"q_values/1_player{pid+1}",
+                        values=q_valid_pid,
+                        global_step=self.global_step
+                    )
+
+                # ---- Player 2 argmax 直方图 ----
+                q_player_argmax = q_player_pred.argmax(dim=-1)  # [B*T, 5]
+                num_bins = q_player_pred.shape[-1]  # 19
+
+                for pid in range(5):
+                    mask_pid = valid_mask_player[:, pid]  # [B*T]
+                    argmax_valid = q_player_argmax[:, pid][mask_pid]  # [N]
+
+                    self.logger.experiment.add_histogram(
+                        tag=f"actions/2_player{pid+1}_argmax_bin",
+                        values=argmax_valid,
+                        global_step=self.global_step
+                    )
+                
+
+                # # ---- Player argmax bin ----
+                # q_player_argmax = q_player_pred.argmax(dim=-1)  # [B*T, 5]
+                # for pid in range(5):
+                #     argmax_valid = q_player_argmax[:, pid][valid_mask_player[:, pid, 0]]
+                #     self.logger.experiment.add_histogram(
+                #         tag=f"actions/player{pid+1}_argmax_bin",
+                #         values=argmax_valid,
+                #         global_step=self.global_step
+                #     )
+
+
+        return total_loss,td_loss,cql_loss,entropy_mean,qsq_loss,kl_loss
+
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=self.cfg.Optimizer.lr,
+            eps=self.cfg.Optimizer.eps,
+            weight_decay=self.cfg.Optimizer.decay
+        )
+
+        # === 可配置参数 ===
+        warmup_steps = 500
+        total_steps = self.trainer.max_epochs * 300  # 假设每个 epoch 大约 100 step
+        min_lr = 1e-5
+        init_lr = self.cfg.Optimizer.lr
+
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                scale = float(current_step) / float(max(1, warmup_steps))
+            else:
+                progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                scale = 1.0 - progress
+            # 🚨 clip 最小值
+            return max(scale, min_lr / init_lr)
+        
+        scheduler = LambdaLR(optimizer, lr_lambda)
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",  #  一定要按 step 更新
+                "frequency": 1,
+                "name": "linear_warmup_decay"
+            },
+        }
+
+    
+
+
+
+if __name__ == '__main__':
+    #test_valend()
+    print('wx')

@@ -1,7 +1,7 @@
 import sys, pathlib
 from torch.utils.data import Dataset
 import os
-os.chdir('/mnt/nvme_share/srt02/EPV_Transformer/QT_NBA2')
+os.chdir('/root/QT_NBA2')
 import glob
 import sys
 import warnings

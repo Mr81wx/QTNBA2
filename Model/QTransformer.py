@@ -56,13 +56,13 @@ class SelfAttLayerCausalTime(nn.Module):
 
         return x_out
 
-
+#10.14 Encoder onlyGAT
 class Encoder(nn.Module):
     def __init__(
         self, device,
         in_feat_dim=1, time_steps=80,
         feature_dim=128, head_num=6,
-        n_player_ids=501                 # 0 号留给球
+        n_player_ids=600                # 0号留给球
     ):
         super().__init__()
         self.device = device
@@ -71,8 +71,8 @@ class Encoder(nn.Module):
         assert feature_dim % head_num == 0
 
         #
-        self.input_embedding = nn.Embedding(600,12)
-        self.input_project = nn.Linear(4,12)
+        self.hex_embedding = nn.Embedding(600,12,padding_idx=598) #0-503 有效值 504-599 padding 598
+        #self.hex_project = nn.Linear(4,12)
 
         # ---- Embedding ----
         self.player_embedding = nn.Embedding(n_player_ids, 12)
@@ -90,31 +90,35 @@ class Encoder(nn.Module):
         #     nn.BatchNorm1d(feature_dim), nn.LeakyReLU(),
         # )
 
-        self.layer_A = nn.Sequential(nn.Linear(12,32), Permute4Batchnorm((0,2,1)),
-                            nn.BatchNorm1d(32), Permute4Batchnorm((0,2,1)), nn.ReLU(), 
-                            nn.Linear(32,128), Permute4Batchnorm((0,2,1)),
-                            nn.BatchNorm1d(128), Permute4Batchnorm((0,2,1)), nn.ReLU(), 
-                            nn.Linear(128,feature_dim), Permute4Batchnorm((0,2,1)),
+        self.layer_A = nn.Sequential(nn.Linear(36,64), Permute4Batchnorm((0,2,1)),
+                            nn.BatchNorm1d(64), Permute4Batchnorm((0,2,1)), nn.ReLU(), 
+                            nn.Linear(64,256), Permute4Batchnorm((0,2,1)),
+                            nn.BatchNorm1d(256), Permute4Batchnorm((0,2,1)), nn.ReLU(), 
+                            nn.Linear(256,feature_dim), Permute4Batchnorm((0,2,1)),
                             nn.BatchNorm1d(feature_dim), Permute4Batchnorm((0,2,1)), nn.ReLU() )
         self.layer_A.apply(init_xavier_glorot)
 
         # ---- PosEnc + Self‑Att ----
-        self.posenc  = PositionalEncoding(feature_dim, 0.1, time_steps)
-        self.selfatt1 = SelfAttLayerCausalTime(time_steps, feature_dim, head_num, 0.1)
-        self.selfatt2 = SelfAttLayerCausalTime(time_steps, feature_dim, head_num, 0.1)
-        self.selfatt3 = SelfAttLayerCausalTime(time_steps, feature_dim, head_num, 0.1)
+        #self.posenc  = PositionalEncoding(feature_dim, 0.1, time_steps)
+        #self.selfatt1 = SelfAttLayerCausalTime(time_steps, feature_dim, head_num, 0.1)
+        #self.selfatt2 = SelfAttLayerCausalTime(time_steps, feature_dim, head_num, 0.1)
+        #self.selfatt3 = SelfAttLayerCausalTime(time_steps, feature_dim, head_num, 0.1)
 
         # ---- GATv2Conv（帧内）----
         self.gat1 = GATv2Conv(feature_dim, feature_dim, head_num, edge_dim=1, concat=False)
         self.gat2 = GATv2Conv(feature_dim, feature_dim, head_num, edge_dim=1, concat=False)
         self.gat3 = GATv2Conv(feature_dim, feature_dim, head_num, edge_dim=1, concat=False)
 
+        self.norm1 = nn.LayerNorm(self.D)
+        self.norm2 = nn.LayerNorm(self.D)
+        self.norm3 = nn.LayerNorm(self.D)
+
 
     # ---------------- forward ----------------
     def forward(self, state_feat, padding_mask, agent_ids,edge_index,edge_attr):
         """
-        state_feat : (B*A, T, 5) [x,y,xv,yv,hex_index]
-        padding_mask: (B*A, T)
+        state_feat : (B*A, T, 1) [hex_index]
+        padding_mask: (B*A, T) # if add spatial-attention
         agent_ids  : (B*A,)
         edge_index: [B,T]
         edge_attr: [B,T,132,1]
@@ -126,42 +130,38 @@ class Encoder(nn.Module):
 
         #embedding states to 12
         #x,y,vx,vy
-        state_con = state_feat[...,:4]
-        state_xy = self.input_project(state_con)  # shape: [..., 12]
-        #grid
-        grid_id = state_feat[..., -1]
-        grid_id  = grid_id.squeeze(-1)
-        grid_id = torch.where(grid_id == 1e9, torch.full_like(grid_id, 599), grid_id) #实际有效值为0-503,padding 值 599,右边半场无效为598
-        grid_id  = self.input_embedding(grid_id.long()) #[B*A,T,12]
+        #state_con = state_feat[...,:4]
+        #state_xy = self.input_project(state_con)  # shape: [..., 12]
+        #hex
+        hex_id = state_feat[..., -1]
+        hex_id  = hex_id.squeeze(-1)
+        hex_id = torch.where(hex_id == 1e9, torch.full_like(hex_id, 598), hex_id) #实际有效值为0-503,padding 值 599,右边半场无效为598
+        hex_emb  = self.hex_embedding(hex_id.long()) #[B*A,T,12] 
 
         #qsq = state_feat[..., 1:]
         #qsq = self.qsq_project(qsq) #[B*A,T,12]
 
         # ---- Player Embedding ----
-        emb = self.player_embedding(agent_ids.clamp(min=0))  # [B*A, 12]
-        emb = emb.unsqueeze(1).expand(-1, T, -1)             # [N, T, 12]
+        player_emb = self.player_embedding(agent_ids.clamp(min=0))  # [B*A, 12]
+        player_emb = player_emb.unsqueeze(1).expand(-1, T, -1)             # [N, T, 12]
 
         # ---- Index Embedding ----
         index_ids = torch.arange(self.A, device=self.device).view(1, self.A, 1).expand(B, self.A, T)  # [B, A, T]
         index_emb = self.index_embedding(index_ids).reshape(B * self.A, T, -1)    
 
-        x = state_xy + grid_id + emb + index_emb #[B*A,T,12]
+        x = torch.cat([ hex_emb, player_emb, index_emb], dim=-1) #[B*A,T,12*3]
 
         # ---- Layer A ----
         #x = rearrange(x, 'n t d -> (n t) d')    # [N*T, D]
         x = self.layer_A(x)                     # e.g. Linear, MLP, LayerNorm...
         #x = rearrange(x, '(n t) d -> n t d', n=N, t=T)  # [N, T, D]
-
-        player_ = x.clone()
         
         # ---- PosEnc & Self‑Att + 三次 GAT ----
-        x = self.posenc(x)
+        #x = self.posenc(x) 不需要位置编码
 
         
-        for self_att, gat in [(self.selfatt1, self.gat1),
-                              (self.selfatt2, self.gat2),
-                              (self.selfatt3, self.gat3)]:
-            x = self_att(x, padding_mask)                    # [N, T, D]
+        for  gat, norm in zip([self.gat1, self.gat2, self.gat3], [self.norm1, self.norm2, self.norm3]):
+            #x = self_att(x, padding_mask)                    # [N, T, D]
 
             x_btad = x.view(B, self.A, T, self.D).permute(0, 2, 1, 3)  # [B, T, A, D]
 
@@ -171,9 +171,13 @@ class Encoder(nn.Module):
                 edge_attr
             )
 
-            x = x_btad.permute(0, 2, 1, 3).reshape(N, T, self.D)  # [N, T, D]
+            x_ = x_btad.permute(0, 2, 1, 3).reshape(N, T, self.D)  # [N, T, D]
 
-        return x, player_
+            x = norm(x + x_)   # Residual connection + LayerNorm
+
+           
+
+        return x #[N, T, D]
  
 
 
@@ -241,7 +245,7 @@ class Decoder(nn.Module):
         memory_mask: [T, S] — prefix mask for cross-attn
         return_all_attn: bool — whether to return all attention weights from each layer
         """
-        T, B, D = x.shape
+        T, B, D = x.shape 
         S = memory.size(0)
 
         # Add positional encoding
@@ -305,12 +309,19 @@ class QTransformer(nn.Module):
         #self.num_agents = cfg.num_agents
 
         self.state_embedding = Encoder(self.device, in_feat_dim=cfg.in_feat_dim, time_steps=cfg.time_steps, feature_dim=self.embed_dim, head_num=cfg.encoder_n_head)
-        self.identify_embedding = nn.Sequential(
-                                    nn.Linear(12, 64),
-                                    nn.LeakyReLU(),
-                                    nn.Linear(64, self.embed_dim)
-                                    )
-        self.action_bin_embeddings = nn.Embedding(cfg.num_bins + 1 , cfg.embed_dim) #有一个padding
+        # self.identify_embedding = nn.Sequential(
+        #                             nn.Linear(12, 64),
+        #                             nn.LeakyReLU(),
+        #                             nn.Linear(64, self.embed_dim)
+        #                             )
+        #self.action_bin_embeddings = nn.Embedding(cfg.num_bins+1, cfg.embed_dim,padding_idx=30) #有一个padding
+        self.ball_action_bin_embeddings = nn.Embedding(cfg.num_bins+1, cfg.embed_dim,padding_idx=30) #有一个padding
+        self.player_action_bin_embeddings = nn.Embedding(cfg.num_bins+1, cfg.embed_dim,padding_idx=30) #有一个padding
+
+
+        self.posenc  = PositionalEncoding(self.embed_dim, 0.1, 12)
+
+        self.fuse_layer = nn.Linear(self.embed_dim * 2, self.embed_dim)
 
         self.decoder = Decoder(
             num_layers=cfg.decoder_layers,
@@ -319,6 +330,14 @@ class QTransformer(nn.Module):
             dropout=cfg.dropout,
             max_seq_len=self.max_tokens
         )
+
+        self.decoder_qsq = nn.Sequential(
+            nn.Linear(self.embed_dim, self.embed_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.embed_dim // 2, 1)
+        )
+
+        nn.init.kaiming_uniform_(self.decoder_qsq[0].weight, a=math.sqrt(5))
 
         self.q_head_1 = nn.Sequential(
             nn.Linear(cfg.embed_dim, cfg.embed_dim),
@@ -345,7 +364,6 @@ class QTransformer(nn.Module):
         )
 
 
-
         self.q_head_1.apply(init_weights)
         self.q_head_2.apply(init_weights)
         self.qball_head_1.apply(init_weights)
@@ -362,68 +380,87 @@ class QTransformer(nn.Module):
            '''
         
         
-        
         # Encode Step
-        state_feat,player_embedding = self.state_embedding(state_tokens, padding_mask, agent_ids,edge_index,edge_attr)
+        state_feat = self.state_embedding(state_tokens, padding_mask, agent_ids,edge_index,edge_attr) #[B*A,T,D]
         #print("state_feat NaN:", torch.isnan(state_feat).any())
         state_feat = rearrange(state_feat, '(b a) t d -> b a t d', a=12)
         state_embed = state_feat.mean(dim=1) # [B, T, D]
 
         B, T, D = state_embed.shape
+
+        player_embed_ = state_feat[:,:6,:,:] #[B,6,T,D]
         
         #Decoder Step
        
         #player embedding [B,D]
-        player_embed = rearrange(player_embedding, '(b a) t d -> b a t d', a=12)
-        player_embed_ = player_embed[:,:6,:,:] #[B,6,T,D]
+        #player_embed = rearrange(player_embedding, '(b a) t d -> b a t d', a=12)
+        #player_embed_ = player_embed[:,:6,:,:] #[B,6,T,D]
         #player_embed_ = self.identify_embedding(player_embed_) #[B,6,T,D]
 
         #player embedding [B,T,D] 直接用node feature 
         #player_embed_ = state_feat[:,:6,:,:] # [B,6,T,D] 5.25修改
         
         #action action_tokens [B,6,T,1]
-        action_tokens = rearrange(action_tokens, '(b n) t -> b n t',n=6) # [B,6,T,1]
-        action_tokens = action_tokens.clamp(min=0) #确保action 没有负数，0-7 为球，8-26
-        action_embed = self.action_bin_embeddings(action_tokens) # [B,6,T,D]
+        
+        action_tokens_ = rearrange(action_tokens, '(b n) t -> b n t',n=6) # [B,6,T]
+        ball_action_tokens = action_tokens_[:,0:1,:] #[B,1,T]
+        player_action_tokens = action_tokens_[:,1:,:] #[B,5,T]
+
+        ball_action_embed = self.ball_action_bin_embeddings(ball_action_tokens)  # [B, 1, T, D]
+        player_action_embed = self.player_action_bin_embeddings(player_action_tokens)  # [B, 5, T, D]
+       # print(action_tokens_.dtype)
+        #print("action_tokens:", action_tokens_.shape)
+        action_embed = torch.cat([ball_action_embed, player_action_embed], dim=1)
+        #action_embed = self.action_bin_embeddings(action_tokens_) # [B,6,T,D]
         #action_embed_ = rearrange(action_embed, '(b n t) d -> b n t d', b = Batch_size,n=6,t=T)# B,6,T,D
 
         #bulid prefix_memory [B*T,S,D] Sequence = [State,P0 embedd, P0 action, P1 embedd, P1 action....]
         S = rearrange(state_embed, 'b t d -> (b t) d').unsqueeze(1)   # B*T,1,D
-        P = rearrange(player_embed_, 'b a t d -> (b t) a d') # B*T,6,D
+        
+        P = rearrange(player_embed_, 'b a t d -> (b t) a d') # B*T,6,D #ball  o1 o2 o3 o4 o5 player embedding
+        assert P.shape == (B*T, 6, D)
         A = rearrange(action_embed , 'b a t d -> (b t) a d') # B*T,6,D
 
-        A = P + A # B*T,6,D
+        #A = torch.cat([P,A],dim = -1) # B*T,6,D*2
+        #A = self.fuse_layer(A) # B*T,6,D
 
-        seq = [S]  # 首先加上 state token
+        seq = torch.zeros(B*T, 12, D, device=P.device)
 
-        # 按照 P0, A0, ..., P5, A5 拼接
         for i in range(6):
-            seq.append(P[:, i:i+1, :])  # 取第 i 个 player embedding，形状 [B*T, 1, D]
-            seq.append(A[:, i:i+1, :])  # 取第 i 个 action embedding，形状 [B*T, 1, D]
+            seq[:, i*2, :] = P[:, i, :]    # 偶数位置放P
+            seq[:, i*2+1, :] = A[:, i, :]  # 奇数位置放A
 
         # 拼接
-        SPA = torch.cat(seq, dim=1)  # [B*T, 13, D]
+        SPA = torch.cat([S, A], dim=1) 
+        assert SPA.shape == (B*T, 7, D)
 
-        assert P.shape == (B*T, 6, D)
-        assert SPA.shape == (B*T, 13, D)
+        
+        #decoder_input = self.posenc(P) # [B*T,6,D]
+        decoder_input = self.posenc(seq) # [B*T,12,D]
+        decoder_input  = rearrange(decoder_input, 'b a d -> a b d')     # [12, B*T, D]
+        
+        #prefix_memory  = rearrange(SPA, 'b s d -> s b d')   # [7, B*T, D]
+        #prefix_memory = prefix_memory[ :-1 , :, : ]  # 不需要最后一个球员的动作 # [6, B*T, D]
+        prefix_memory = rearrange(state_feat, 'b a t d -> a (b t) d')   # [12, B*T, D]
+        assert prefix_memory.shape == (12, B*T, D)
+        # prefix_mask = build_prefix_mask(
+        #     T = self.num_actions,
+        #     prefix_lens=[2 * i + 1 for i in range(self.num_actions)],
+        #     total_mem_len=1 + 2 * self.num_actions,
+        #     device=self.device
+        # )
+        
+        #prefix_mask = torch.triu(torch.ones(12, 12, dtype=torch.bool, device=self.device), diagonal=1)
+        prefix_mask = torch.zeros(12, 12, dtype=torch.bool, device=self.device)
 
-        decoder_input  = rearrange(P, 'b a d -> a b d')     # [6, B*T, D]
-        prefix_memory  = rearrange(SPA, 'b s d -> s b d')   # [13, B*T, D]
-
-        prefix_mask = build_prefix_mask(
-            T = self.num_actions,
-            prefix_lens=[2 * i + 1 for i in range(self.num_actions)],
-            total_mem_len=1 + 2 * self.num_actions,
-            device=self.device
-        )
-
-        causal_mask = torch.triu(torch.ones(self.num_actions, self.num_actions, device=self.device), diagonal=1).bool()
+        causal_mask = torch.triu(torch.ones(self.num_actions *2 , self.num_actions *2, device=self.device), diagonal=1).bool()
         # Decode
         decoder_out = self.decoder(decoder_input, prefix_memory, tgt_mask=causal_mask, memory_mask=prefix_mask)
-
+        #decoder_out [n,b,d] n=6 b=B*T d=128
+        decoder_out = decoder_out[::2,:,:]  # 只取P 对应的输出 [6, B*T, D]
         # Predict Q-values at each decoder step
-        q1_players = self.q_head_1(decoder_out[1:,:,:])   #[n b d]
-        q2_players  = self.q_head_2(decoder_out[1:,:,:])
+        q1_players = self.q_head_1(decoder_out[1:,:,:])   #[5 b d]
+        q2_players  = self.q_head_2(decoder_out[1:,:,:])  #[5 b d]
 
         q_min_players  = torch.min(q1_players, q2_players)
         q_avg_players  = (q1_players + q2_players) / 2
@@ -444,6 +481,12 @@ class QTransformer(nn.Module):
         q1_ball = rearrange(q1_ball,'n b d -> b n d')
         q2_ball = rearrange(q2_ball,'n b d -> b n d')
 
+
+        #predict qsq
+        offense_encode = state_feat[:,1:6,:,:]# [B,5,T,D]
+        qsq = self.decoder_qsq(offense_encode) # [B,5,T,1]
+        #print('qsq',qsq.shape)
+
         out =  {
         "players": {
             "min": q_min_players,
@@ -456,101 +499,102 @@ class QTransformer(nn.Module):
             "avg": q_avg_ball,
             "1":   q1_ball,
             "2":   q2_ball,
-        }
+        },
+        "qsq": qsq # [B,5,T,1]
     }
-        return out #[B*T,a, num_bins]
+        return out 
 
-    @torch.no_grad()
-    def get_random_action(self, batch_size):
-        """
-        第0个动作从 bin 0~5 中选，其余动作从 bin 6~24 中选。
-        返回: [B, 6] 的 tensor, 每个位置是 bin 索引
-        """
-        device = self.device
+    # @torch.no_grad()
+    # def get_random_action(self, batch_size):
+    #     """
+    #     第0个动作从 bin 0~5 中选，其余动作从 bin 6~24 中选。
+    #     返回: [B, 6] 的 tensor, 每个位置是 bin 索引
+    #     """
+    #     device = self.device
 
-        # 第0个位置：从 0~5 采样
-        ball_action = torch.randint(0, 8, (batch_size, 1), device=device) #0-7
+    #     # 第0个位置：从 0~5 采样
+    #     ball_action = torch.randint(0, 8, (batch_size, 1), device=device) #0-7
 
-        # 第1~5个位置：从 6~24 采样
-        player_actions = torch.randint(8, 27, (batch_size, 5), device=device) #8-26
+    #     # 第1~5个位置：从 6~24 采样
+    #     player_actions = torch.randint(8, 27, (batch_size, 5), device=device) #8-26
 
-        # 拼接得到完整 action tensor
-        return torch.cat([ball_action, player_actions], dim=1)  # [B, 6]
+    #     # 拼接得到完整 action tensor
+    #     return torch.cat([ball_action, player_actions], dim=1)  # [B, 6]
 
 
-    @torch.no_grad() 
-    def get_optimal_actions(self, state_tokens, agent_ids, padding_mask, edge_index,edge_attr,prob_random_action=0.1):
-        #
-        """
-            自回归推理，根据当前状态逐步预测动作序列。
+    # @torch.no_grad() 
+    # def get_optimal_actions(self, state_tokens, agent_ids, padding_mask, edge_index,edge_attr,prob_random_action=0.1):
+    #     #
+    #     """
+    #         自回归推理，根据当前状态逐步预测动作序列。
         
-        Args:
-            state_tokens: [B*A, T, 1] B=1 ->[12,80,1]
-            agent_ids: [B*A] -> [12]
-            padding_mask: [A, T]-> [12,121]  
-            prob_random_action: 随机探索概率(epsilon-greedy)
+    #     Args:
+    #         state_tokens: [B*A, T, 1] B=1 ->[12,80,1]
+    #         agent_ids: [B*A] -> [12]
+    #         padding_mask: [A, T]-> [12,121]  
+    #         prob_random_action: 随机探索概率(epsilon-greedy)
         
-        Returns:
-            optimal_actions: [B, num_agents, T]，每个agent每个时间步的动作索引
-        """
-        B = state_tokens.size(0) // 12  # 假设agent总数为12
-        assert B == 1 
-        T = state_tokens.size(1)
-        device = state_tokens.device
-        num_agents = 6  # 球和进攻球员数
-        num_bins = self.cfg.num_bins
+    #     Returns:
+    #         optimal_actions: [B, num_agents, T]，每个agent每个时间步的动作索引
+    #     """
+    #     B = state_tokens.size(0) // 12  # 假设agent总数为12
+    #     assert B == 1 
+    #     T = state_tokens.size(1)
+    #     device = state_tokens.device
+    #     num_agents = 6  # 球和进攻球员数
+    #     num_bins = self.cfg.num_bins
 
-        optimal_actions = torch.zeros(B, num_agents, T, dtype=torch.long, device=device)
+    #     optimal_actions = torch.zeros(B, num_agents, T, dtype=torch.long, device=device)
 
-        with torch.no_grad():
-            state_feat, player_embedding = self.state_embedding(state_tokens, padding_mask, agent_ids,edge_index,edge_attr)
-            state_feat = rearrange(state_feat, '(b a) t d -> b a t d', a=12)
-            player_embed = rearrange(player_embedding, '(b a) d -> b a d', a=12)
-            player_embed_ = self.identify_embedding(player_embed[:, :6, :])
+    #     with torch.no_grad():
+    #         state_feat, player_embedding = self.state_embedding(state_tokens, padding_mask, agent_ids,edge_index,edge_attr)
+    #         state_feat = rearrange(state_feat, '(b a) t d -> b a t d', a=12)
+    #         player_embed = rearrange(player_embedding, '(b a) d -> b a d', a=12)
+    #         player_embed_ = self.identify_embedding(player_embed[:, :6, :])
 
-            for t in range(T):
-                # 当前状态
-                S = state_feat[:, :, t, :].mean(dim=1, keepdim=True)  # [B,1,D]
-                P = player_embed_  # [B,6,D]
+    #         for t in range(T):
+    #             # 当前状态
+    #             S = state_feat[:, :, t, :].mean(dim=1, keepdim=True)  # [B,1,D]
+    #             P = player_embed_  # [B,6,D]
 
-                # 已有动作作为输入
-                seq = [S]
-                for i in range(num_agents):
-                    seq.append(P[:, i:i+1, :])
-                    if t == 0:
-                        seq.append(torch.zeros(B, 1, self.embed_dim, device=device))
-                    else:
-                        prev_action_embed = self.action_bin_embeddings(optimal_actions[:, i, t-1])
-                        seq.append(prev_action_embed.unsqueeze(1))
+    #             # 已有动作作为输入
+    #             seq = [S]
+    #             for i in range(num_agents):
+    #                 seq.append(P[:, i:i+1, :])
+    #                 if t == 0:
+    #                     seq.append(torch.zeros(B, 1, self.embed_dim, device=device))
+    #                 else:
+    #                     prev_action_embed = self.action_bin_embeddings(optimal_actions[:, i, t-1])
+    #                     seq.append(prev_action_embed.unsqueeze(1))
 
-                SPA = torch.cat(seq, dim=1)  # [B,13,D]
+    #             SPA = torch.cat(seq, dim=1)  # [B,13,D]
 
-                decoder_input = rearrange(P, 'b a d -> a b d')
-                prefix_memory = rearrange(SPA, 'b s d -> s b d')
+    #             decoder_input = rearrange(P, 'b a d -> a b d')
+    #             prefix_memory = rearrange(SPA, 'b s d -> s b d')
 
-                prefix_mask = build_prefix_mask(
-                    T=num_agents,
-                    prefix_lens=[2 * i + 1 for i in range(num_agents)],
-                    total_mem_len=1 + 2 * num_agents,
-                    device=device
-                )
+    #             prefix_mask = build_prefix_mask(
+    #                 T=num_agents,
+    #                 prefix_lens=[2 * i + 1 for i in range(num_agents)],
+    #                 total_mem_len=1 + 2 * num_agents,
+    #                 device=device
+    #             )
 
-                causal_mask = torch.triu(torch.ones(num_agents, num_agents, device=device), diagonal=1).bool()
+    #             causal_mask = torch.triu(torch.ones(num_agents, num_agents, device=device), diagonal=1).bool()
 
-                decoder_out = self.decoder(decoder_input, prefix_memory, tgt_mask=causal_mask, memory_mask=prefix_mask)
+    #             decoder_out = self.decoder(decoder_input, prefix_memory, tgt_mask=causal_mask, memory_mask=prefix_mask)
 
-                q1 = self.q_head_1(decoder_out)
-                q2 = self.q_head_2(decoder_out)
+    #             q1 = self.q_head_1(decoder_out)
+    #             q2 = self.q_head_2(decoder_out)
 
-                q_values = (q1 + q2) / 2  # [6,B,num_bins]
+    #             q_values = (q1 + q2) / 2  # [6,B,num_bins]
 
-                optimal_actions_t = q_values.argmax(dim=-1).T
+    #             optimal_actions_t = q_values.argmax(dim=-1).T
 
-                if prob_random_action > 0:
-                    random_actions = torch.randint(0, num_bins, optimal_actions_t.shape, device=device)
-                    random_mask = torch.rand(optimal_actions_t.shape, device=device) < prob_random_action
-                    optimal_actions_t = torch.where(random_mask, random_actions, optimal_actions_t)
+    #             if prob_random_action > 0:
+    #                 random_actions = torch.randint(0, num_bins, optimal_actions_t.shape, device=device)
+    #                 random_mask = torch.rand(optimal_actions_t.shape, device=device) < prob_random_action
+    #                 optimal_actions_t = torch.where(random_mask, random_actions, optimal_actions_t)
 
-                optimal_actions = optimal_actions.scatter(dim=2, index=torch.tensor([t], device=device).unsqueeze(0).unsqueeze(0), src=optimal_actions_t.unsqueeze(2))
+    #             optimal_actions = optimal_actions.scatter(dim=2, index=torch.tensor([t], device=device).unsqueeze(0).unsqueeze(0), src=optimal_actions_t.unsqueeze(2))
 
-        return optimal_actions  # [B, num_agents, T]
+    #     return optimal_actions  # [B, num_agents, T]

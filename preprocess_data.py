@@ -181,12 +181,12 @@ def process_single_scene(scene, player_mapper, max_t=80, gamma=0.95, flag=0):
 
 @hydra.main(config_path="conf", config_name="config.yaml")
 def main(cfg):
-    input_dir = '/mnt/nvme_share/srt02/EPV_Transformer/QT_NBA/shotData_516'
-    output_dir = '/mnt/nvme_share/srt02/EPV_Transformer/QT_NBA/shotData_516_processed'
+    input_dir = '/root/autodl-fs/shotData_516'
+    output_dir = '/root/autodl-fs/shotData_onlyball_preprocessed'
     os.makedirs(output_dir, exist_ok=True)
 
     dataset = SceneDataset(input_dir)
-    player_mapper = PlayerIDMapper("/mnt/nvme_share/srt02/EPV_Transformer/QT_NBA/players.csv")
+    player_mapper = PlayerIDMapper("/root/QT_NBA2/players.csv")
 
     print(f"Starting preprocessing of {len(dataset)} files...")
     processed_count = 0

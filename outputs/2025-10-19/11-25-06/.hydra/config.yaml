@@ -1,0 +1,31 @@
+device_ids: 0
+max_epochs: 30
+batchsize: 96
+flag: 0
+check_point_name: 1016_ballqsq_ballaction
+Optimizer:
+  lr: 0.005
+  eps: 1.0e-05
+  decay: 0.0001
+discount_factor_gamma: 0.95
+min_reward: -3.0
+td_loss_coef: 1.0
+cql_loss_coef: 1.0
+qtransformer:
+  device: cuda:0
+  in_feat_dim: 1
+  time_steps: 80
+  embed_dim: 128
+  num_bins: 30
+  num_bins_player: 19
+  num_bins_ball: 6
+  num_actions: 6
+  max_tokens: 32
+  decoder_layers: 3
+  n_head: 8
+  encoder_n_head: 4
+  dropout: 0.1
+ema:
+  beta: 0.99
+  update_after_step: 10
+  update_every: 5

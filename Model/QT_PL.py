@@ -59,31 +59,49 @@ class QT(pl.LightningModule):
                              update_every = cfg.ema.update_every)
     
     def forward(self, batch):
-        state_tokens = batch['state_tokens']
+        state_tokens = batch['state_tokens'] #598为无效帧补齐的
         agent_ids = batch['agent_ids']
-        padding_mask = batch['padding_mask'] #[B*A,T]
-        action_tokens = batch['action_tokens'] # [B*A,T]
+        padding_mask = batch['padding_mask'] #[B*A,T] 
+        action_tokens = batch['action_tokens'] # [B*A,T] #30为无效帧补齐的
 
         edge_index = batch['edge_index']  #[2,110]
         edge_attr = batch['edge_attr'] #[B,T,110,1]
 
-        rewards = batch['rewards'] #[B,T] 实际最后一个timesteps都是shot，只有a0一个action
+        rewards = batch['rewards'] #[B,T] 实际最后一个timesteps都是shot，只有a0一个action -1e9 为无效
         done = batch['done'] # [B] 每一个回合的实际长度
 
         monte_carlo_return = default(batch['mc_return'], -1e4) #[B,T]
 
-        out = self.model(state_tokens, agent_ids, padding_mask, action_tokens,edge_index,edge_attr) #[B*T,6,25]
+        out = self.model(state_tokens, agent_ids, padding_mask, action_tokens, edge_index, edge_attr) 
+        # out =  {
+        # "players": {
+        #     "min": q_min_players,
+        #     "avg": q_avg_players,
+        #     "1":   q1_players,
+        #     "2":   q2_players,
+        # },
+        # "ball": {
+        #     "min": q_min_ball,
+        #     "avg": q_avg_ball,
+        #     "1":   q1_ball,
+        #     "2":   q2_ball,
+        # },
+        # "qsq": qsq # [B,6,T,1]
+        #}
+
         return out
 
     def training_step(self, batch, batch_idx):
-        total_loss,td_loss,conservative_reg_loss,entropy_mean,reverse_penalty = self.compute_loss(batch)
+        total_loss,td_loss,cql_loss,entropy_mean,qsq_loss,kl_loss = self.compute_loss(batch)
 
         self.log_dict({
             "train/total_loss": total_loss,
             "train/td_loss": td_loss,
-            "train/cql_loss": conservative_reg_loss,
+            "train/cql_loss": cql_loss,
             "train/entropy" : entropy_mean,
-            "train/reverse_penalty": reverse_penalty,
+            "train/qsq":qsq_loss,
+            "train/kl_loss":kl_loss
+            #"train/reverse_penalty": reverse_penalty,
         }, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train/lr", self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=False)
             
@@ -135,9 +153,10 @@ class QT(pl.LightningModule):
 
         q_player_selected = batch_player_select_indices(q_player_avg, action_tokens) #[B*T, 5]
 
-        mask_ball = ((ball_action != 27) & (ball_action != 7)).reshape(-1) # [B*T]
+        #mask_ball = ((ball_action != 27) & (ball_action != 7)).reshape(-1) # [B*T]
+        mask_ball = (ball_action != 30).reshape(-1) # [B*T]
         mask_ball = mask_ball.unsqueeze(-1)  # [B*T, 1]
-        mask_player =  (player_action != 27) # [B*T,5]
+        mask_player =  (player_action != 30) # [B*T,5]
 
         q_mean_ball = q_ball_selected[mask_ball.bool()].mean()
         q_mean_player = q_player_selected[mask_player.bool()].mean()
@@ -167,6 +186,8 @@ class QT(pl.LightningModule):
         # ---------- 3. L1( Q_p5 , MC ) ----------
         q_p5_selected = q_player_selected[...,-1] #[B,T]
         q_p5_selected = rearrange(q_p5_selected, '(b t) -> b t', b=B)  # [B, T]
+        
+        mc_return = mc_return.squeeze(-1)  # [B,T]
         l1 = F.l1_loss(q_p5_selected, mc_return, reduction='none')  # [B,T]
         
         mask_p5 = mask_player[..., -1]  # [B*T]
@@ -194,23 +215,25 @@ class QT(pl.LightningModule):
         edge_idx = batch['edge_index']            # [2,132]
         edge_attr= batch['edge_attr']             # [B,T,132,1]
 
+        qsq_gt = batch['qsq']                     # [B*5,T]
+
         B, T = rewards.shape
         Y = self.discount_factor_gamma
 
-        #state mask， 对于在state中有球员在后场的情况都不去计算该球员的移动loss，{TODO_ 同时对于球的行为7的不去计算这一帧与球相关的loss}
-        state_x = state_tokens[...,0] #[B*A,T]
-        state_x = rearrange(state_x,'(b a) t -> b t a',b=B)
-        state_x = state_x[:,:,:6] # [B,T,5]
-        #invalid_state_mask = (state_x > 53).float()  # [B, T， 5]，
-        invalid_state_mask = (state_x > 53).any(dim=-1)  # [B, T] 对任意state中有进攻球员在后场，都直接不算其loss
+        # #state mask， 对于在state中有球员在后场的情况都不去计算该球员的移动loss，{TODO_ 同时对于球的行为7的不去计算这一帧与球相关的loss}
+        # state_x = state_tokens[...,0] #[B*A,T]
+        # state_x = rearrange(state_x,'(b a) t -> b t a',b=B)
+        # state_x = state_x[:,:,:6] # [B,T,5]
+        # #invalid_state_mask = (state_x > 53).float()  # [B, T， 5]，
+        # invalid_state_mask = (state_x > 53).any(dim=-1)  # [B, T] 对任意state中有进攻球员在后场，都直接不算其loss
         
         # 构造每个样本 done-1 的索引
-        batch_idx = torch.arange(B, device=done.device)  # [B]
-        last_valid_idx = done - 1                        # [B]
+        # batch_idx = torch.arange(B, device=done.device)  # [B]
+        # last_valid_idx = done - 1                        # [B]
 
         # 在 invalid_state_mask 中将 done-1 的帧置为 False,确保投篮帧的loss一定考虑
-        invalid_state_mask = invalid_state_mask.clone()
-        invalid_state_mask = invalid_state_mask.scatter(dim=1, index=last_valid_idx.unsqueeze(1), value=False)
+        # invalid_state_mask = invalid_state_mask.clone()
+        # invalid_state_mask = invalid_state_mask.scatter(dim=1, index=last_valid_idx.unsqueeze(1), value=False)
 
 
         # ---------- 前向 ----------
@@ -224,9 +247,12 @@ class QT(pl.LightningModule):
         q_pl_2   = out_pred['players']['2']
         q_pl_avg = out_pred['players']['avg']
         
-        q_ball_1 = out_pred['ball']['1'] #[ B*T,1, 8]
+        q_ball_1 = out_pred['ball']['1'] #[ B*T,1, 6]
         q_ball_2 = out_pred['ball']['2']
         q_ball_avg = out_pred['ball']['avg']
+
+        qsq_pred = out_pred['qsq'].squeeze(-1) # [B,5,T]
+        #print("qsq_pred:", qsq_pred.shape)
 
         # ---------- select 本步 Q ----------
 
@@ -247,25 +273,25 @@ class QT(pl.LightningModule):
         
        
         # ---------- target 网络 ----------
-        ball_action = action_tokens[0::6,:] #[B,T]
-        valid_mask_ball =  (ball_action != 27)
-        valid_mask_ball = valid_mask_ball.reshape(-1, 1, 1).expand(-1, 1, 8)  #[B*T,1,8]
+        ball_action = action_tokens[0::6,:] #[B,T] action_tokens [B*6,T]
+        valid_mask_ball =  (ball_action != 30) #[B,T] 30为无效帧补齐的
+        valid_mask_ball = valid_mask_ball.reshape(-1, 1, 1).expand(-1, 1, 6)  #[B*T,1,6]
 
-        ball_action7 = (ball_action == 7) #[B,T]
-        mask = rearrange(ball_action7, 'b t -> (b t) 1 1')  #[B*T,1,8]
-        mask = mask.expand(-1, 1, 8)                        # [B*T, 1, 8]
-        action7_mask = mask.float()
+        #ball_action7 = (ball_action == 7) #[B,T]
+        #mask = rearrange(ball_action7, 'b t -> (b t) 1 1')  #[B*T,1,8]
+        #mask = mask.expand(-1, 1, 8)                        # [B*T, 1, 8]
+        #action7_mask = mask.float()
         # 把 bin=7 的位置改回 0
-        action7_mask = action7_mask.scatter(dim=-1, index=torch.tensor([7], device=action7_mask.device).unsqueeze(0).unsqueeze(0), value=0.0) # True for mask  
+        #action7_mask = action7_mask.scatter(dim=-1, index=torch.tensor([7], device=action7_mask.device).unsqueeze(0).unsqueeze(0), value=0.0) # True for mask  
 
-        mask_ = (~ball_action7).reshape(-1, 1, 1).expand(-1, 1, 8).float()
-        mask_ = mask_.scatter(dim=-1, index=torch.arange(7, device=mask_.device).unsqueeze(0).unsqueeze(0), value=0.0) # True for mask   把正常frame中的action设置为-1e9，这样max的不会选择这个action
+        #mask_ = (~ball_action7).reshape(-1, 1, 1).expand(-1, 1, 8).float()
+        #mask_ = mask_.scatter(dim=-1, index=torch.arange(7, device=mask_.device).unsqueeze(0).unsqueeze(0), value=0.0) # True for mask   把正常frame中的action设置为-1e9，这样max的不会选择这个action
 
-        action7_mask = action7_mask + mask_
+        #action7_mask = action7_mask + mask_
 
         player_action = rearrange(action_tokens,'(b a) t -> b a t',a = 6)[:,1:,:]
         player_action = rearrange(player_action, 'b a t -> (b t) a') #[B*T,5]
-        valid_mask_player = (player_action != 27) #[B*T,5]
+        valid_mask_player = (player_action != 30) #[B*T,5]
         valid_mask_player = valid_mask_player.unsqueeze(-1).expand(-1, -1, 19) #[B*T,5,19]
 
         with torch.no_grad():
@@ -273,104 +299,139 @@ class QT(pl.LightningModule):
                                         padding_mask, action_tokens,
                                         edge_idx, edge_attr)
             q_pl_target   = out_target['players']['min']   # 取 avg 头 or min [ B*T,5, 19] 
-            q_ball_target = out_target['ball']['min']  #[ B*T,1, 8] 
+            q_ball_target = out_target['ball']['min']  #[ B*T,1, 6] 
 
-            q_pl_target = q_pl_target * valid_mask_player.float()
-            q_ball_target = q_ball_target * valid_mask_ball.float()
-            
-            q_ball_target = q_ball_target * action7_mask.float() #对于实际ball action = 7 on air 的需要对其设置0-6都为-1e9 
-            
+            q_pl_target = q_pl_target * valid_mask_player.float() #把无效帧的q值设置为0
+            q_ball_target = q_ball_target * valid_mask_ball.float() #把无效帧的q值设置为0
+                        
             q_ball_target_max = q_ball_target.max(dim=-1).values          # [B*T, 1]
             q_pl_target_max = q_pl_target.max(dim=-1).values  #[B*T,5]
 
             q_target = torch.cat([q_ball_target_max, q_pl_target_max], dim=-1) #[B*T, 6]
-            q_target = rearrange(q_target, '(b t) n -> b t n', b=B)
+            q_target = rearrange(q_target, '(b t) n -> b t n', b=B) # [B, T, 6]
 
-
-            mc_ret   = repeat(default(mc_ret, -50), 'b t -> (b t) n', n=6)
-            q_target = q_target.clamp(min=mc_ret.reshape(B, T, 6))
+            mc_ret = mc_ret.squeeze(-1)  # [B,T]
+            mc_ret   = repeat(default(mc_ret, -10), 'b t -> (b t) n', n=6) # [B*T, 6]
+            #q_target = q_target.clamp(min=mc_ret.reshape(B, T, 6))
 
         # ---------- 分离predict [ball,p1,p2,p3,p4] [p5]   ----------
         # ---------- 分离target  [p1,p2,p3,p4,p5]   [ball] ----------
         #            对应计算loss ball_pred <-> p1_target .... p5_pred <-> r + y * ball_target
 
+        # q_pred_rest = index 0-5 ,q_pred_last = index 6
         q_pred_rest_1, q_pred_last_1 = q_pred_1[..., :-1], q_pred_1[..., -1] #[B，T, 5]，[B,T]
         q_pred_rest_2, q_pred_last_2 = q_pred_2[..., :-1], q_pred_2[..., -1] #[B，T, 5]，[B,T]
         q_target_first, q_target_rest = q_target[..., 0], q_target[..., 1:] #[B, T]，[B*T, 5]
 
-
+        # q_pred_rest 和 q_target_rest 求td loss， q_pred_last 和 q_target_first 求td loss
         # smooth‑l1 for ball + player 1-4 
         losses_rest_1 = F.smooth_l1_loss(q_pred_rest_1, q_target_rest,
-                                        reduction='none')
+                                        reduction='none') #[B，T, 5]
         losses_rest_2 = F.smooth_l1_loss(q_pred_rest_2, q_target_rest,
-                                        reduction='none')
+                                        reduction='none') #[B，T, 5]
 
         
-        loss_1_mask = build_loss_mask_from_lengths(done-1, T).to(losses_rest_1.device) #[B,T]
-        final_loss_1_mask = loss_1_mask.bool() & (~invalid_state_mask.bool())
+        #loss_1_mask = build_loss_mask_from_lengths(done-1, T).to(losses_rest_1.device) #[B,T] 把时间维度 T-1 之后都设置0，因为投篮之后球员的动作不影响reward
+        loss_1_mask = build_loss_mask_from_lengths(done-1, T).to(losses_rest_1.device) #[B,T] 先尝试不管投篮之后的帧
+
+        final_loss_1_mask = loss_1_mask.bool() 
         final_loss_1_mask = final_loss_1_mask.unsqueeze(-1).expand(-1, -1, 5)
 
         loss_1_1 = losses_rest_1 * final_loss_1_mask.float()
-        loss_1_2 = losses_rest_2 * final_loss_2_mask.float()  #[B,T,5]
+        loss_1_2 = losses_rest_2 * final_loss_1_mask.float()  #[B,T,5]
 
         # last‑step ball TD
         q_target_ball = rewards[...,:-1] + Y * q_target_first[...,1:] #[B,T-1]
 
         # add final reward to q_target_first[B,done] 修改终结帧的q_target 直接等于reward
         #batch_idx = torch.arange(B)
-        final_rewards = rewards[batch_idx, done - 1]
+        #final_rewards = rewards[batch_idx, done - 1]
 
-        valid_idx = done >= 2  # 防止 done=1 时索引 < 0
+        #valid_idx = done >= 2  # 防止 done=1 时索引 < 0
 
         # 使用非原地操作替换原地赋值
-        q_target_ball = q_target_ball.clone()
-        batch_indices = batch_idx[valid_idx]
-        done_indices = done[valid_idx] - 2
-        final_rewards_valid = final_rewards[valid_idx]
+        #q_target_ball = q_target_ball.clone()
+        #batch_indices = batch_idx[valid_idx]
+        #done_indices = done[valid_idx] - 2
+        #final_rewards_valid = final_rewards[valid_idx]
         
         # 使用scatter进行非原地赋值
-        indices = torch.stack([batch_indices, done_indices], dim=1)
-        q_target_ball = q_target_ball.scatter(dim=0, index=indices, src=final_rewards_valid.unsqueeze(1))
+        #indices = torch.stack([batch_indices, done_indices], dim=1)
+        #q_target_ball = q_target_ball.scatter(dim=0, index=indices, src=final_rewards_valid.unsqueeze(1))
 
-        q_pred_last_1 = q_pred_last_1[...,:-1]
-        q_pred_last_2 = q_pred_last_2[...,:-1]
+        #q_pred_last_1 = q_pred_last_1[...,:-1]
+        #q_pred_last_2 = q_pred_last_2[...,:-1]
 
-        loss_2_1 = F.smooth_l1_loss(q_pred_last_1, q_target_ball,reduction='none') #[B,T-1]
-        loss_2_2 = F.smooth_l1_loss(q_pred_last_2, q_target_ball,reduction='none') #[B,T-1]
+        #loss_2_1 = F.smooth_l1_loss(q_pred_last_1, q_target_ball,reduction='none') #[B,T-1]
+        #loss_2_2 = F.smooth_l1_loss(q_pred_last_2, q_target_ball,reduction='none') #[B,T-1]
+
+        #只看球
+        q_pred_first_1 = q_pred_1[...,0] #[B,T]
+        q_pred_first_2 = q_pred_2[...,0] #[B,T]
+        q_pred_first_1 = q_pred_first_1[...,:-1] #[B,T-1]
+        q_pred_first_2 = q_pred_first_2[...,:-1] #[B,T-1]
+
+    
+        loss_2_1 = F.smooth_l1_loss(q_pred_first_1, q_target_ball,reduction='none') #[B,T-1]
+        loss_2_2 = F.smooth_l1_loss(q_pred_first_2, q_target_ball,reduction='none') #[B,T-1]
         
         loss_2_mask = build_loss_mask_from_lengths(done-1, T-1).to(loss_2_1.device) # [B,T-1] 
 
-        invalid_state_mask_1 = invalid_state_mask[:,:-1]
-        invalid_state_mask_2 = invalid_state_mask[:,1:]
-        invalid_td_mask = invalid_state_mask_1 | invalid_state_mask_2 #true for padding
+        #invalid_state_mask_1 = invalid_state_mask[:,:-1]
+        #invalid_state_mask_2 = invalid_state_mask[:,1:]
+        #invalid_td_mask = invalid_state_mask_1 | invalid_state_mask_2 #true for padding
 
-        final_loss_2_mask = loss_2_mask.bool() & (~invalid_td_mask.bool())
+        final_loss_2_mask = loss_2_mask.bool()# & (~invalid_td_mask.bool())
 
         loss_2_1 = loss_2_1 * final_loss_2_mask.float()#[B,T-1]
         loss_2_2 = loss_2_2 * final_loss_2_mask.float()#[B,T-1]
 
 
-        #------------球员原地踏步的action 降低权重 --------- action_token = 8
-        action_player_ = rearrange(action_tokens,'(b a) t -> b t a',b = B) #[B,T,6]
-        bin_8_mask = (action_player_ == 8).float() #[B,T,6]
+        #shot loss 直接监督最后一帧的q值等于reward #[B，T, 6]
 
-        bin_8_mask_1 = bin_8_mask[...,:-1] #ball,p1-p4的mask，针对loss_1_ #[B,T,5]
-        loss_weight_1 = 1.0 - 0.5 * bin_8_mask_1  # 把 bin=8 的 loss 权重调成 0.5，其余为 1.0
-        loss_1_1 = loss_1_1 * loss_weight_1  # [B, T, 5] × [B, T, 5]
-        loss_1_2 = loss_1_2 * loss_weight_1
+        batch_indices = torch.arange(B, device=done.device)
+        time_indices = done - 1  # shape: [B]
+        q_pred_shot_1 = q_pred_1[batch_indices, time_indices, 0]  # [B]
+        q_pred_shot_2 = q_pred_2[batch_indices, time_indices, 0]  # [B]
+        final_rewards = rewards[batch_indices, time_indices]     # [B]
 
-        bin_8_mask_2 = bin_8_mask[:,:-1,-1] #p5 [B,T-1]
-        loss_weight_2 = 1.0 - 0.5 * bin_8_mask_2  # 把 bin=8 的 loss 权重调成 0.5，其余为 1.0
-        loss_2_1 = loss_2_1 * loss_weight_2  # [B, T, 5] × [B, T, 5]
-        loss_2_2 = loss_2_2 * loss_weight_2
+        #mu = torch.tensor(0.8191, device=final_rewards.device)
+        #alpha = torch.tensor(2.5, device=final_rewards.device)
+
+        #final_rewards = mu + alpha * (final_rewards - mu)
+
+
+        loss_3_1 = F.smooth_l1_loss(q_pred_shot_1, final_rewards, reduction='none') #[B]
+        loss_3_2 = F.smooth_l1_loss(q_pred_shot_2, final_rewards, reduction='none') #[B]
+
+
+        #------------球员原地踏步的action 降低权重 --------- action_token = 6
+        # action_player_ = rearrange(action_tokens,'(b a) t -> b t a',b = B) #[B,T,6]
+        # bin_8_mask = (action_player_ == 8).float() #[B,T,6]
+
+        # bin_8_mask_1 = bin_8_mask[...,:-1] #ball,p1-p4的mask，针对loss_1_ #[B,T,5]
+        # loss_weight_1 = 1.0 - 0.5 * bin_8_mask_1  # 把 bin=8 的 loss 权重调成 0.5，其余为 1.0
+        # loss_1_1 = loss_1_1 * loss_weight_1  # [B, T, 5] × [B, T, 5]
+        # loss_1_2 = loss_1_2 * loss_weight_1
+
+        # bin_8_mask_2 = bin_8_mask[:,:-1,-1] #p5 [B,T-1]
+        # loss_weight_2 = 1.0 - 0.5 * bin_8_mask_2  # 把 bin=8 的 loss 权重调成 0.5，其余为 1.0
+        # loss_2_1 = loss_2_1 * loss_weight_2  # [B, T, 5] × [B, T, 5]
+        # loss_2_2 = loss_2_2 * loss_weight_2
 
 
         #summmary td_loss
 
-        td_loss_1 = 0.5 * loss_1_1.mean() + 0.5 *loss_2_1.mean()
-        td_loss_2 = 0.5 * loss_1_2.mean() + 0.5 *loss_2_2.mean()
+        td_loss_1 = loss_1_1.mean() + loss_1_2.mean()
+        td_loss_2 = loss_2_1.mean() + loss_2_2.mean()
+        td_loss_3 = loss_3_1.mean() + loss_3_2.mean()
         
-        td_loss = (td_loss_1 + td_loss_2)/2
+        #td_loss = (td_loss_1 + td_loss_2 + td_loss_3)/2
+
+        td_loss = (
+    (loss_2_1.sum() + loss_2_2.sum() + loss_3_1.sum() + loss_3_2.sum())
+    / (loss_2_1.numel() + loss_2_2.numel() + loss_3_1.numel() + loss_3_2.numel())
+)
         
         #-----------------------------------------------------------------
 
@@ -390,43 +451,71 @@ class QT(pl.LightningModule):
 
         
 
-        cql_loss_ball_1 = cql_loss_hard_ball(q_ball_1,ball_action,self.min_reward,q_pl_1.device) # [B*T, 1, 8]
-        cql_loss_ball_2 = cql_loss_hard_ball(q_ball_2,ball_action,self.min_reward,q_pl_1.device) # [B*T, 1, 8]
-
+        #cql_loss_ball_1 = cql_loss_hard_ball(q_ball_1,ball_action,self.min_reward,q_pl_1.device) # [B*T, 1, 6]
+        #cql_loss_ball_2 = cql_loss_hard_ball(q_ball_2,ball_action,self.min_reward,q_pl_1.device) # [B*T, 1, 6]
+        cql_loss_ball_1 = cql_loss_logsumexp_ball(q_ball_1,ball_action,q_ball_1.device) # [B*T, 1]
+        cql_loss_ball_2 = cql_loss_logsumexp_ball(q_ball_2,ball_action,q_ball_2.device) # [B*T, 1]
 
         #state mask，剔除游球员和球在后场时的帧
-        mask_cql_player = rearrange(invalid_state_mask, 'b t -> (b t) 1 1')  # [B*T,1,1]
+        #mask_cql_player = rearrange(invalid_state_mask, 'b t -> (b t) 1 1')  # [B*T,1,1]
+        # mask_cql_player = build_loss_mask_from_lengths(done, T).to(cql_loss_player_1.device) #[B,T] 
+        # mask_cql_player = rearrange(mask_cql_player, 'b t -> (b t) 1 1')  # [B*T,1,1]
+        # cql_loss_player_1 = cql_loss_player_1 * (~mask_cql_player.expand_as(cql_loss_player_1)).float()
+        # cql_loss_player_2 = cql_loss_player_2 * (~mask_cql_player.expand_as(cql_loss_player_2)).float()
 
-        cql_loss_player_1 = cql_loss_player_1 * (~mask_cql_player.expand_as(cql_loss_player_1)).float()
-        cql_loss_player_2 = cql_loss_player_2 * (~mask_cql_player.expand_as(cql_loss_player_2)).float()
-
-        cql_loss_ball_1 = cql_loss_ball_1 * (~mask_cql_player.expand_as(cql_loss_ball_1)).float()
-        cql_loss_ball_2 = cql_loss_ball_2 * (~mask_cql_player.expand_as(cql_loss_ball_2)).float()
+        # cql_loss_ball_1 = cql_loss_ball_1 * (~mask_cql_player.expand_as(cql_loss_ball_1)).float()
+        # cql_loss_ball_2 = cql_loss_ball_2 * (~mask_cql_player.expand_as(cql_loss_ball_2)).float()
         
-        print("Valid CQL player elements:", (cql_loss_player_1 != 0).sum().item())
-        print("Valid CQL ball elements:", (cql_loss_ball_1 != 0).sum().item())
+        # print("Valid CQL player elements:", (cql_loss_player_1 != 0).sum().item())
+        # print("Valid CQL ball elements:", (cql_loss_ball_1 != 0).sum().item())
 
-        cql_loss_1 = 0.5 * cql_loss_player_1.mean() + 0.5 * cql_loss_ball_1.mean()
+        cql_loss_1 =  cql_loss_player_1.mean() + cql_loss_ball_1.mean()
                       
-        cql_loss_2 = 0.5 * cql_loss_player_2.mean() + 0.5 * cql_loss_ball_2.mean()
+        cql_loss_2 =  cql_loss_player_2.mean() + cql_loss_ball_2.mean()
 
         cql_loss = (cql_loss_1 + cql_loss_2) / 2
+        #cql_loss = cql_loss_2
 
 
         #-----------------------------------------------------------------
 
         # conservative loss     
-        entropy_player_1 = entropy_reg_player(q_pl_1, player_action)
-        entropy_player_2 = entropy_reg_player(q_pl_2, player_action)
+        # entropy_player_1 = entropy_reg_player(q_pl_1, player_action)
+        # entropy_player_2 = entropy_reg_player(q_pl_2, player_action)
 
         entropy_ball_1 = entropy_reg_ball(q_ball_1, ball_action)
         entropy_ball_2 = entropy_reg_ball(q_ball_2, ball_action)
 
-        entropy_mean = entropy_player_1 + entropy_player_2 + entropy_ball_1 + entropy_ball_2
+        #entropy_mean = entropy_player_1 + entropy_player_2 + entropy_ball_1 + entropy_ball_2
+        entropy_mean =  entropy_ball_1 + entropy_ball_2
 
-        total_loss = (self.cfg.td_loss_coef * td_loss +
-                    self.cfg.cql_loss_coef * cql_loss -
-                    0.5 * entropy_mean)
+
+        #qsq predict loss 
+        qsq_gt = rearrange(qsq_gt,'(b a) t -> b a t',a = 5) #[B,5,T]
+        qsq_loss = F.mse_loss(qsq_gt, qsq_pred, reduction='none') #[B,5,T]
+        qsq_loss_mask = build_loss_mask_from_lengths(done, T).to(qsq_loss.device) #[B,T]
+        qsq_loss_mask = qsq_loss_mask.bool().unsqueeze(1).expand(-1, 5, -1) #[B,5,T]
+        qsq_loss = (qsq_loss * qsq_loss_mask.float()).mean()
+
+        #KL loss
+        kl_loss_q1 = compute_kl_regularizer(q_ball_1, ball_action, alpha_kl=0.05)
+        kl_loss_q2 = compute_kl_regularizer(q_ball_2, ball_action, alpha_kl=0.05)
+
+        kl_loss = (kl_loss_q1 + kl_loss_q2) /2
+
+        if self.global_step % 50 == 0:  # 每 500 步打印一次
+            b_idx = 0  # 打印第一个 batch 的样本
+            t_idx = done[b_idx] - 1  # 打印最后一帧（done帧）
+            
+            print(f"\n[Step {self.global_step}] QSQ Prediction Example:")
+            print(f"GT   : {qsq_gt[b_idx, :, t_idx].detach().cpu().numpy()}")
+            print(f"Pred : {qsq_pred[b_idx, :, t_idx].detach().cpu().numpy()}")
+
+        # total_loss = (self.cfg.td_loss_coef * td_loss +
+        #             self.cfg.cql_loss_coef * cql_loss -
+        #             0 * entropy_mean + 0.1 * qsq_loss)
+        total_loss = td_loss +  cql_loss + 0.5 * qsq_loss - 0.0 * entropy_mean + kl_loss
+        #total_loss =   0.1 * qsq_loss
 
         if self.global_step % 50 == 0:
             with torch.no_grad():
@@ -453,6 +542,12 @@ class QT(pl.LightningModule):
                 # ---- Ball argmax bin ----
                 q_ball_argmax = q_ball_pred.argmax(dim=-1).reshape(-1)  # [B*T]
                 q_ball_argmax_valid = q_ball_argmax[valid_mask_ball[..., 0].squeeze(-1)]  # [N]
+
+                num_bins = q_ball_pred.shape[-1]  # 比如8
+                bin_counts = torch.bincount(q_ball_argmax_valid, minlength=num_bins)
+
+                # 打印统计结果
+                print(f"Ball action bin counts: {bin_counts.tolist()}")
                 self.logger.experiment.add_histogram(
                     tag="actions/ball_argmax_bin",
                     values=q_ball_argmax_valid,
@@ -470,7 +565,7 @@ class QT(pl.LightningModule):
                     )
 
 
-        return total_loss,td_loss,cql_loss,entropy_mean
+        return total_loss,td_loss,cql_loss,entropy_mean,qsq_loss,kl_loss
 
 
     def configure_optimizers(self):
@@ -483,8 +578,8 @@ class QT(pl.LightningModule):
 
         # === 可配置参数 ===
         warmup_steps = 500
-        total_steps = self.trainer.max_epochs * 1000  # 假设每个 epoch 大约 100 step，你也可以自己传入
-        min_lr = 1e-8
+        total_steps = self.trainer.max_epochs * 300  # 假设每个 epoch 大约 100 step
+        min_lr = 1e-5
         init_lr = self.cfg.Optimizer.lr
 
         def lr_lambda(current_step):
