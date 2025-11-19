@@ -1,24 +1,51 @@
-environment //
-  PyTorch  2.1.2 //
-  Python  3.10(ubuntu22.04) //
-  CUDA  11.8 //
-  pytorch-lightning 2.2.1 //
+PyTorch             2.1.2   
+Python              3.10 (Ubuntu 22.04)  
+CUDA                11.8  
+PyTorch Lightning   2.2.1  
 
 
-data format #每一个.pt文件代表一个回合 //
+data format #每一个.pt文件代表一个回合   
+```
 {
-    "state_tokens": [T, 12, 1],     # ball + players + rim, 
-    "agent_ids": [11]               # ball = 0, rim = 500,
-    "padding_mask"  [12, T]         # padding for encoder temporal attention,
-    "action_tokens": [T, 6],        # ball & player discrete bins,
-    "rewards": [T],                 # reward_t = qsq_t+1 - qsq_t 
-    "done": [T],                    # episode length
-    "edge_index": [2, E],           # graph edges
-    "edge_attr": [E,T,D],            # edge attr [,132，3] 全连接图，
-    "qsq": [T,5]
+    "state_tokens": [T, 12, 1],     
+        # 12 agents: ball + 5 offense + 5 defense + rim
+        # hexagon index for position
+
+    "agent_ids": [12],                 
+        # agent type encoding:
+        #   ball = 0, players = 1~10, rim = 500
+
+    "padding_mask": [12, T],           
+        # temporal padding mask for attention
+
+    "action_tokens": [T, 6],           
+        # ball & player discrete bins
+        # ball: 0~5 ; players: 6~24 ; 30 = padding
+
+    "rewards": [T],                    
+        # shaped reward:
+        #   reward_t = qsq[t+1] - qsq[t]
+
+    "done": [T],                       
+        # episode termination marker
+
+    "edge_index": [2, E],              
+        # fully-connected graph edges
+        # typical E = 132
+
+    "edge_attr": [E, T, D],            
+        # edge features:
+        #   D = 3 → (dx, dy, distance)
+        #   shape example: [132, T, 3]
+
+    "qsq": [T, 5]                      
+        # team-level evaluation signal
 }
+```
+
 
 config 
+```
 {  
     # setting
     device_ids: 0
@@ -63,11 +90,17 @@ config
       update_after_step: 10
       update_every: 5
 }
-  
+```  
 
 python train_dueling_pointerdecoder.py \
     model=QTransformerSoftPointer \
     data.path=/path/to/your/data \
     trainer.max_epochs=30 (30mins 1 epoch)
+
+
+<img width="934" height="882" alt="image" src="https://github.com/user-attachments/assets/bd7418b0-7645-43a6-bd7d-ec90a0fafaa2" />
+
+<img width="974" height="512" alt="image" src="https://github.com/user-attachments/assets/a4b01c52-b952-4c21-8f48-7aacec39ad95" />
+
 
 
