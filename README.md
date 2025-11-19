@@ -1,11 +1,11 @@
-environment
-  PyTorch  2.1.2
-  Python  3.10(ubuntu22.04)
-  CUDA  11.8
-  pytorch-lightning 2.2.1
+environment //
+  PyTorch  2.1.2 //
+  Python  3.10(ubuntu22.04) //
+  CUDA  11.8 //
+  pytorch-lightning 2.2.1 //
 
 
-data format #每一个.pt文件代表一个回合
+data format #每一个.pt文件代表一个回合 //
 {
     "state_tokens": [T, 12, 1],     # ball + players + rim, 
     "agent_ids": [11]               # ball = 0, rim = 500,
