@@ -20,12 +20,14 @@ data format #每一个.pt文件代表一个回合
 
 config 
 {  
+    # setting
     device_ids: 0
     max_epochs: 30
     batchsize: 96
     flag: 0
     check_point_name: 1116_ShareV_6actions
     only_ball: False
+    
     # === Optimizer Settings ===
     Optimizer:
       lr: 1e-3
