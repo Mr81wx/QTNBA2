@@ -499,7 +499,7 @@ def get_relative_code(index1, index2):
 
 
 
-def batch_ball_select_indices(q_values, actions):
+def batch_ball_select_indices(q_values, actions,num_bins):
     """
     安全选择 Q(s, a) 并处理 -1 padding。
 
@@ -516,8 +516,6 @@ def batch_ball_select_indices(q_values, actions):
     
     actions = rearrange(actions, '(b a) t -> (b t) a', a=6)  # [B*T, 6]
     ball_action = actions[:,0:1] #[B*T, 1]
-
-    num_bins = 6
 
     # expand dims to gather: [B*T, 1, 1]
     action_indices = ball_action.unsqueeze(-1)  # [B*T, 1, 1]
@@ -666,7 +664,7 @@ def cql_loss_logsumexp_player(q_preds_player, actions_player, q_pred_device, min
     lse = torch.logsumexp(q_weighted, dim=-1, keepdim=True)  # [B*T, 5, 1]
 
     # Conservative loss: encourage Q(s,a) ≤ log ∑ Q(s,a')
-    conservative_loss = (lse - q_taken).clamp(min=0.0)
+    conservative_loss = (lse - q_taken) #.clamp(min=0.0)
 
     # Optionally mask out padding
     if mask_invalid:
@@ -676,7 +674,7 @@ def cql_loss_logsumexp_player(q_preds_player, actions_player, q_pred_device, min
     return conservative_loss.squeeze(-1)  # [B*T, 5]
 
 
-def cql_loss_logsumexp_ball(q_preds_ball, actions_ball, q_pred_device, min_reward=-1e3, mask_invalid=True):
+def cql_loss_logsumexp_ball(q_preds_ball, actions_ball, q_pred_device, min_reward=-1e3, mask_invalid=True,temperature=2.0):
     """
     Conservative Q-Learning loss for ball action branch using logsumexp formulation.
     
@@ -693,11 +691,12 @@ def cql_loss_logsumexp_ball(q_preds_ball, actions_ball, q_pred_device, min_rewar
     B, T = actions_ball.shape
     BT = B * T
     num_bins = q_preds_ball.shape[-1]
+    print('q_preds_ball',q_preds_ball.shape)
     
     actions_flat = rearrange(actions_ball,'B T -> (B T)')  # [B*T]
 
     action_weights = torch.ones_like(q_preds_ball)  # shape [B*T, 1, 6]
-    action_weights[..., 0] *= 1.5  # 鼓励
+    #action_weights[..., 0] *= 1.5  # 鼓励
     q_weighted = q_preds_ball * action_weights
 
     # Gather Q(s,a) — actual taken action Q-value
@@ -705,10 +704,10 @@ def cql_loss_logsumexp_ball(q_preds_ball, actions_ball, q_pred_device, min_rewar
     q_taken = torch.gather(q_preds_ball, dim=-1, index=safe_actions[:, None, None])  # [B*T, 1, 1]
 
     # logsumexp over all actions
-    lse = torch.logsumexp(q_preds_ball, dim=-1, keepdim=True)  # [B*T, 1, 1]
+    lse = torch.logsumexp(q_weighted / temperature, dim=-1, keepdim=True) * temperature  # [B*T, 1, 1]
 
     # Conservative loss: encourage Q(s,a) ≤ log ∑ Q(s,a')
-    conservative_loss = (lse - q_taken).clamp(min=0.0)  # [B*T, 1, 1]
+    conservative_loss = (lse - q_taken) # .clamp(min=0.0)  # [B*T, 1, 1]
 
     # Optionally mask out padding
     if mask_invalid:

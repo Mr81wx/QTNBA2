@@ -2,7 +2,7 @@ device_ids: 0
 max_epochs: 30
 batchsize: 96
 flag: 0
-check_point_name: 1030_soft_ball_pl
+check_point_name: 1116_ShareV_6actions
 only_ball: False
 # === Optimizer Settings ===
 Optimizer:
@@ -11,7 +11,7 @@ Optimizer:
   decay: 0.0001
 
 # === Reinforcement Learning Settings ===
-discount_factor_gamma: 0.98
+discount_factor_gamma: 0.99
 min_reward: -3.0
 td_loss_coef: 1.0
 cql_loss_coef: 1.0
