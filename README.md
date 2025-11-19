@@ -33,13 +33,13 @@ data format #每一个.pt文件代表一个回合
         # fully-connected graph edges
         # typical E = 132
 
-    "edge_attr": [E, T, D],            
+    "edge_attr": [T, E, D],            
         # edge features:
         #   D = 3 → (dx, dy, distance)
-        #   shape example: [132, T, 3]
+        #   shape example: [T,132,3]
 
     "qsq": [T, 5]                      
-        # team-level evaluation signal
+        # 辅助任务标签
 }
 ```
 
