@@ -476,28 +476,6 @@ def build_hex_indexer(r=1.5, rect_width=52, rect_height=52, padding_idx=600):
 
 
 
-def get_relative_code(index1, index2):
-    """根据 hex 编号差值，获取相对方向编码，支持奇偶列规则。"""
-    delta = index2 - index1
-
-    odd_position_rules = {
-        0: 0, 24: 1, 25: 2, 1: 3, -24: 4, -1: 5, 23: 6, 48: 7, 49: 8,
-        26: 9, 2: 10, -22: 11, -23: 12, -48: 13, -25: 14, -26: 15, -2: 16, 22: 17, 47: 18
-    }
-
-    even_position_rules = {
-        0: 0, 24: 1, 1: 2, -23: 3, -24: 4, -25: 5, -1: 6, 48: 7, 25: 8,
-        26: 9, 2: 10, -22: 11, -47: 12, -48: 13, -49: 14, -26: 15, -2: 16, 22: 17, 23: 18
-    }
-
-    if index1 % 2 == 1:
-        code = odd_position_rules.get(delta, -1)
-    else:
-        code = even_position_rules.get(delta, -1)
-
-    return code + 8 if code != -1 else -1  # -1 表示非法方向
-
-
 
 def batch_ball_select_indices(q_values, actions,num_bins):
     """
@@ -540,7 +518,7 @@ def batch_player_select_indices(q_values, actions):
     安全选择 Q(s, a) 并处理 -1 padding。
 
     Args:
-        q_values: [B*T, 5, 19] — Q-values for all actions per agent
+        q_values: [B*T, 5, 36] — Q-values for all actions per agent
         actions:  [B*A, T] — actions taken (agent flattened)
         num_bins: int — total number of discrete actions
 
@@ -553,21 +531,19 @@ def batch_player_select_indices(q_values, actions):
     actions = rearrange(actions, '(b a) t -> (b t) a', a=6)  # [B*T, 6]
     player_actions = actions[:,1:] #[B*T, 5]
 
-    num_bins = 19
+    num_bins = 36
 
     # expand dims to gather: [B*T, 5, 1]
     action_indices = player_actions.unsqueeze(-1)  # [B*T, 5, 1]
 
-    # 判断动作索引是否在合法范围 8~26, True for 合法
-    valid_mask = (action_indices >= 6) & (action_indices < 6 + num_bins) # [B*T, 5, 1]
+    # 判断动作索引是否在合法范围 0~36, True for 合法
+    valid_mask = (action_indices >= 0) & (action_indices < num_bins) # [B*T, 5, 1]
 
     safe_indices = player_actions.clone()
     safe_indices = safe_indices.unsqueeze(-1)  # [B*T, 5, 1]    
 
-    safe_indices = torch.where(valid_mask, safe_indices, torch.full_like(safe_indices, 6))  # 用6（合法最小动作）替代无效动作索引，避免报错
+    safe_indices = torch.where(valid_mask, safe_indices, torch.full_like(safe_indices, 0))  # 用0（合法最小动作）替代无效动作索引，避免报错
 
-    # 映射到0~18范围索引
-    safe_indices = safe_indices - 6
 
     # gather q值
     q_selected = q_values.gather(dim=-1, index=safe_indices).squeeze(-1)  # [B*T, 5]
@@ -579,61 +555,13 @@ def batch_player_select_indices(q_values, actions):
 
 
 
-def cql_loss_hard_player(q_preds_player, player_action, min_reward, q_pred_device, extra_bins_weight=0.1):
-    """
-    安全选择 Q(s, a) 并处理 -1 padding。
-
-    Args:
-        q_preds_player: [B*T,5,19] 
-        actions_player: [B*T,5] 实际的动作
-        mask_cql: [B] 剔除padding 部分的loss计算
-    Returns:
-        loss
-    """  
-    BT,_ = player_action.shape
-    num_bins = 19
-    # 判断动作索引是否在合法范围 6~24, True for 合法
-    valid_mask = (player_action >= 6) & (player_action < 6 + num_bins) # [B*T, 5]
-
-    safe_indices = player_action.clone() # [B*T, 5]
-    safe_indices = torch.where(valid_mask, safe_indices, torch.full_like(safe_indices, 6))  # 用6（合法最小动作）替代无效动作索引，避免报错
-
-    # 映射到0~18范围索引
-    safe_indices = safe_indices - 6
-
-    # 构建动作 mask
-    mask = torch.zeros(BT, 5, num_bins, dtype=torch.bool, device=q_pred_device)
-    mask = mask.scatter(dim=-1, index=safe_indices.unsqueeze(-1), value=True)  # taken actions = True
-
-    not_taken_mask = ~mask  # [B*T, 5, 19]
-
-    # 惩罚所有未采样的动作 Q
-    q_rest = q_preds_player  # [B*T, 5, 19]
-
-    weights = torch.ones_like(q_rest, device=q_pred_device)
-    #weights = weights.scatter(dim=-1, index=torch.arange(1, 6, device=q_pred_device).unsqueeze(0).unsqueeze(0), value=extra_bins_weight)  # 对于 1-6 小惩罚
-    #weights = weights.scatter(dim=-1, index=torch.arange(7, 19, device=q_pred_device).unsqueeze(0).unsqueeze(0), value=extra_bins_weight * 0.5) #对于 7-24 更小惩罚
-
-    penalty = ((q_rest - min_reward) ** 2) * weights * not_taken_mask.float()
-
-    # 对 padding 部分进行mask , actions_player 中所有=30的都需要mask
-    padding_mask = (player_action == 30)  # [B*T, 5]
-
-    # broadcast 到 [B*T, 5, 19]（沿 bin 维度扩展）
-    padding_mask = padding_mask.unsqueeze(-1).expand(-1, -1, 19)
-
-    # 置零 loss
-    penalty = penalty * (~padding_mask) #  [B*T, 5, 19]
-
-    return penalty
-
 def cql_loss_logsumexp_player(q_preds_player, actions_player, q_pred_device, min_reward=-1e3, mask_invalid=True):
     """
     Conservative Q-Learning loss for ball action branch using logsumexp formulation.
     
     Args:
-        q_preds_player: Tensor of shape [B*T, 5, 19] — predicted Q-values for player actions (19 bins)
-        actions_player: Tensor of shape [B, T, 5] — actual actions taken (6–24 or 30 for padding)
+        q_preds_player: Tensor of shape [B*T, 5, 36] — predicted Q-values for player actions (36 bins)
+        actions_player: Tensor of shape [B, T, 5] — actual actions taken (0–36 or 40 for padding)
         q_pred_device: device (e.g. q_preds_ball.device)
         min_reward: optional lower bound
         mask_invalid: whether to mask out actions where action == 30
@@ -645,14 +573,14 @@ def cql_loss_logsumexp_player(q_preds_player, actions_player, q_pred_device, min
     BT = B * T
     num_bins = q_preds_player.shape[-1]
 
-    assert num_bins == 19
+    assert num_bins == 36
     
     actions_flat = rearrange(actions_player, 'B T P -> (B T) P')  # [B*T, 5]
 
-    actions_flat_local = torch.where(actions_flat != 30, actions_flat - 6, actions_flat)
+    actions_flat_local = torch.where(actions_flat != 40, actions_flat, actions_flat)
 
-    action_weights = torch.ones_like(q_preds_player)  # [B*T, 5, 19]
-    action_weights[..., 0] *= 0.3   
+    action_weights = torch.ones_like(q_preds_player)  # [B*T, 5, 36]
+    action_weights[..., 0] *= 0.5   
     # action_weights[..., 6:12] *= 1.2
     q_weighted = q_preds_player * action_weights
 
@@ -668,7 +596,7 @@ def cql_loss_logsumexp_player(q_preds_player, actions_player, q_pred_device, min
 
     # Optionally mask out padding
     if mask_invalid:
-        padding_mask = (actions_flat == 30).unsqueeze(-1)  # 注意这里用原 actions_flat
+        padding_mask = (actions_flat == 40).unsqueeze(-1)  # 注意这里用原 actions_flat
         conservative_loss = conservative_loss.masked_fill(padding_mask, 0.0)
 
     return conservative_loss.squeeze(-1)  # [B*T, 5]
@@ -680,10 +608,10 @@ def cql_loss_logsumexp_ball(q_preds_ball, actions_ball, q_pred_device, min_rewar
     
     Args:
         q_preds_ball: Tensor of shape [B*T, 1, 6] — predicted Q-values for ball actions (6 bins)
-        actions_ball: Tensor of shape [B, T] — actual actions taken (0–5 or 30 for padding)
+        actions_ball: Tensor of shape [B, T] — actual actions taken (0–5 or 40 for padding)
         q_pred_device: device (e.g. q_preds_ball.device)
         min_reward: optional lower bound
-        mask_invalid: whether to mask out actions where action == 30
+        mask_invalid: whether to mask out actions where action == 40
         
     Returns:
         Tensor of shape [B*T, 1] — CQL loss
@@ -696,7 +624,8 @@ def cql_loss_logsumexp_ball(q_preds_ball, actions_ball, q_pred_device, min_rewar
     actions_flat = rearrange(actions_ball,'B T -> (B T)')  # [B*T]
 
     action_weights = torch.ones_like(q_preds_ball)  # shape [B*T, 1, 6]
-    #action_weights[..., 0] *= 1.5  # 鼓励
+    # 先找到 dribble的位置，然后对 dribble 位置的 action_weights 进行调整，使其在dribble的时候不过度的惩罚别的动作
+    action_weights[..., 0] = 1.5  # 惩罚投篮
     q_weighted = q_preds_ball * action_weights
 
     # Gather Q(s,a) — actual taken action Q-value
@@ -711,51 +640,12 @@ def cql_loss_logsumexp_ball(q_preds_ball, actions_ball, q_pred_device, min_rewar
 
     # Optionally mask out padding
     if mask_invalid:
-        padding_mask = (actions_flat == 30).view(BT, 1, 1)  # [B*T, 1, 1]
+        padding_mask = (actions_flat == 40).view(BT, 1, 1)  # [B*T, 1, 1]
         conservative_loss = conservative_loss.masked_fill(padding_mask, 0.0)
 
     return conservative_loss.squeeze(-1)  # [B*T, 1]
 
 
-def cql_loss_hard_ball(q_preds_ball, actions_ball, min_reward, q_pred_device, extra_bins_weight=0.1):
-    """
-    安全选择 Q(s, a) 并处理 -1 padding。
-
-    Args:
-        q_preds_ball: [B*T,1,6] 
-        actions_Ball: [B,T] 实际的动作
-       
-    Returns:
-        loss
-    """  
-    
-    B, T = actions_ball.shape
-    actions_ball = actions_ball.reshape(B*T)  # [B*T]
-
-    # --- 构建动作 mask ---
-    num_bins = 6
-    mask = torch.zeros(B*T, 1, num_bins, dtype=torch.bool, device=q_pred_device)
-    
-    valid_mask = (actions_ball >= 0) & (actions_ball < num_bins ) #set padding 30 to 0
-    safe_indices = actions_ball.clone()
-    safe_indices = torch.where(valid_mask, safe_indices, torch.zeros_like(safe_indices))  # fallback to bin0
-    mask = mask.scatter(dim=-1, index=safe_indices.unsqueeze(-1).unsqueeze(1), value=True)  # [B*T, 1, 6] taken actions = True
-
-    not_taken_mask = ~mask  # [B*T, 1, 6]
-
-    # --- 惩罚 Q ---
-    weights = torch.ones_like(q_preds_ball, device=q_pred_device)
-    #weights = weights.scatter(dim=-1, index=torch.arange(1, 6, device=q_pred_device).unsqueeze(0).unsqueeze(0), value=extra_bins_weight)     # bin 1~6 小惩罚 传球
-    #weights = weights.scatter(dim=-1, index=torch.tensor([0], device=q_pred_device).unsqueeze(0).unsqueeze(0), value=0.0)                     # bin 0 不惩罚 投篮不惩罚
-
-    penalty = ((q_preds_ball - min_reward) ** 2) * weights * not_taken_mask.float() #[B*T, 1, 6]
-
-    # --- padding mask ---
-    padding_mask = (actions_ball == 30).unsqueeze(-1).unsqueeze(-1)  # [B*T, 1, 1]
-    padding_mask = padding_mask.expand(-1, -1, num_bins)                          # [B*T, 1, 6]
-    penalty = penalty * (~padding_mask).float() #  [B*T, 1, 6]
-
-    return penalty 
 
 def entropy_reg_ball(q_pred, actions_ball,reduced_coef=0.1): #对action = 6 的减小惩罚
     """
@@ -782,18 +672,18 @@ def entropy_reg_ball(q_pred, actions_ball,reduced_coef=0.1): #对action = 6 的�
 def entropy_reg_player(q_pred, actions_player,reduced_coef=0.1): #对action = 6 的减小惩罚
     """
     Args:
-        q_preds_player: [B*T,5,19] 
+        q_preds_player: [B*T,5,36] 
         actions_player: [B*T,5]
     Returns:
         loss
     """ 
-    probs = F.softmax(q_pred, dim=-1)  # [B*T,5,19]
+    probs = F.softmax(q_pred, dim=-1)  # [B*T,5,36]
     log_probs = probs.clamp(min=1e-6).log()        # 防止 log(0)
     
-    weights = torch.ones_like(probs)              # [B*T, 5, 19]
+    weights = torch.ones_like(probs)              # [B*T, 5, 36]
     weights = weights.scatter(dim=-1, index=torch.tensor([0], device=probs.device).unsqueeze(0).unsqueeze(0), value=reduced_coef)        # 让 bin 0 的权重变小
 
-    entropy_per_bin = - (probs * log_probs)       # [B*T, 5, 19]
+    entropy_per_bin = - (probs * log_probs)       # [B*T, 5, 36]
     weighted_entropy = (entropy_per_bin * weights).sum(dim=-1)  # [B*T, 5]
 
     padding_mask = (actions_player == 27)  # [B*T, 5]

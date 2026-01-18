@@ -1,12 +1,12 @@
-device_ids: 0
-max_epochs: 30
+evice_ids: 0
+max_epochs: 200
 batchsize: 96
 flag: 0
-check_point_name: 1116_ShareV_6actions
+check_point_name: 0113_att_gat_noshareV
 only_ball: False
 # === Optimizer Settings ===
 Optimizer:
-  lr: 1e-3
+  lr: 5e-4
   eps: 1e-5
   decay: 0.0001
 
@@ -20,14 +20,14 @@ soft_alpha: 0.1
 # === Model Architecture ===
 qtransformer:
   device: cuda:0
-  in_feat_dim: 1
+  in_feat_dim: 4
   time_steps: 80
   embed_dim: 128
-  num_bins: 30 # 0-5 ball, 6-24 player 30 padding
-  num_bins_player: 19
+  num_bins: 40 # 0-5 ball, 6-24 player 30 padding
+  num_bins_player: 36
   num_bins_ball: 6
   num_actions: 6         # a0 ~ a5
-  max_tokens: 32         # for positional embedding
+  max_tokens: 15         # for positional embedding
   decoder_layers: 3
   n_head: 8
   encoder_n_head: 4
