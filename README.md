@@ -91,5 +91,7 @@ config
       update_every: 5
 }
 ```  
-
+ball action: 0 shot, 1-5 pass to 1-5(Original Order)
+player action: 0 stay, 10-17, 19-26, 28-35 (invalid action id: 1-9,18,27)
+<img width="515" height="493" alt="fdeb4d4b54e8d5bbb1dd8211e8a0e1a6" src="https://github.com/user-attachments/assets/072217ea-4daa-4768-a251-444345d2f341" />
 
