@@ -92,15 +92,4 @@ config
 }
 ```  
 
-python train_dueling_pointerdecoder.py \
-    model=QTransformerSoftPointer \
-    data.path=/path/to/your/data \
-    trainer.max_epochs=30 (30mins 1 epoch)
-
-
-<img width="934" height="882" alt="image" src="https://github.com/user-attachments/assets/bd7418b0-7645-43a6-bd7d-ec90a0fafaa2" />
-
-<img width="974" height="512" alt="image" src="https://github.com/user-attachments/assets/a4b01c52-b952-4c21-8f48-7aacec39ad95" />
-
-
 
